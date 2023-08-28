@@ -1,0 +1,6 @@
+include(boards/common.cmake)
+set(CHIP bl808)
+set(BOARD bl808dk)
+set(CMAKE_C_COMPILER riscv64-unknown-elf-gcc)
+set(CMAKE_CXX_COMPILER riscv64-unknown-elf-g++)
+set(MICROPY_CROSS_FLAGS -march=riscv64)
