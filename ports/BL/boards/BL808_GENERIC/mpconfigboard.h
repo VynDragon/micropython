@@ -6,3 +6,5 @@
 #ifndef MICROPY_HW_MCU_NAME
 #define MICROPY_HW_MCU_NAME "BL602"
 #endif
+
+#define BL808

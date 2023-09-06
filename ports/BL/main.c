@@ -3,7 +3,7 @@
 //#include <stdarg.h>
 
 
-#include "FreeRTOS.h"
+#include <FreeRTOS.h>
 #include "task.h"
 
 #include "py/builtin.h"
@@ -28,20 +28,15 @@
 
 extern void log_start(void);
 
-extern uint32_t __HeapBase;
-extern uint32_t __HeapLimit;
-
-// MicroPython runs as a task under FreeRTOS
-#define MP_TASK_PRIORITY        (ESP_TASK_PRIO_MIN + 1)
-#define MP_TASK_STACK_SIZE      __HeapLimit
+#define MP_TASK_STACK_SIZE      0x0400
 
 // Set the margin for detecting stack overflow, depending on the CPU architecture.
-#define MP_TASK_STACK_LIMIT_MARGIN (1024)
+#define MP_TASK_STACK_LIMIT_MARGIN (0x0040)
 
 
 // Initial Python heap size. This starts small but adds new heap areas on
 // demand due to settings MICROPY_GC_SPLIT_HEAP & MICROPY_GC_SPLIT_HEAP_AUTO
-#define MP_TASK_HEAP_SIZE (16 * 1024)
+#define MP_TASK_HEAP_SIZE (0x1000)
 
 
 int vprintf_null(const char *format, va_list ap) {
@@ -55,10 +50,11 @@ void mp_task(void *pvParameter) {
     #endif
 
     void *mp_task_heap = malloc(MP_TASK_HEAP_SIZE);
+    char *stack = malloc(MP_TASK_STACK_SIZE);
 
 soft_reset:
     // initialise the stack pointer for the main thread
-    mp_stack_set_top((void *)__HeapBase);
+    mp_stack_set_top(stack + MP_TASK_STACK_SIZE);
     mp_stack_set_limit(MP_TASK_STACK_SIZE - MP_TASK_STACK_LIMIT_MARGIN);
     gc_init(mp_task_heap, mp_task_heap + MP_TASK_HEAP_SIZE);
     mp_init();
@@ -114,11 +110,15 @@ soft_reset_exit:
 
 int main(void) {
     board_init();
+
 #if defined(CONFIG_FREERTOS) && CONFIG_FREERTOS
     xTaskCreate(mp_task, "mp_task", MP_TASK_STACK_SIZE / sizeof(StackType_t), NULL, 1, NULL);
     vTaskStartScheduler();
+    while (1) {
+    }
 #else
 // TODO
+    printf("Todo: Non-RTOS support")
 #endif
 }
 

@@ -35,6 +35,8 @@ set(SDKCONFIG ${CMAKE_BINARY_DIR}/sdkconfig)
 
 include(${MICROPY_BOARD_DIR}/mpconfigboard.cmake)
 
+set(MICROPY_CROSS_FLAGS -march=${MARCH} -mabi=${MABI})
+
 # Concatenate all sdkconfig files into a combined one for the IDF to use.
 file(WRITE ${CMAKE_BINARY_DIR}/sdkconfig.combined.in "")
 foreach(SDKCONFIG_DEFAULT ${SDKCONFIG_DEFAULTS})
@@ -95,20 +97,24 @@ list(APPEND MICROPY_SOURCE_QSTR
     ${MICROPY_SOURCE_BOARD}
 )
 
-# Disable some warnings to keep the build output clean.
+
+target_link_libraries(${MICROPY_TARGET} micropy_extmod_btree)
+target_link_libraries(${MICROPY_TARGET} usermod)
+
 target_compile_options(${MICROPY_TARGET} PUBLIC
     -Wno-clobbered
     -Wno-deprecated-declarations
     -Wno-missing-field-initializers
 )
 
-target_link_libraries(${MICROPY_TARGET} micropy_extmod_btree)
-target_link_libraries(${MICROPY_TARGET} usermod)
-
+target_compile_options(micropy_extmod_btree PUBLIC
+    -march=${MARCH}
+    -mabi=${MABI}
+)
 
 # retrieve includes from sdk lib so we dont have to relist all the directory
 get_target_property(sdk_intf_lib_INC sdk_intf_lib INTERFACE_INCLUDE_DIRECTORIES)
-message(sdk_intf_lib_INC="${sdk_intf_lib_INC}")
+message(sdk_intf_lib_INC="${MICROPY_PORT_DIR}")
 target_include_directories(${MICROPY_TARGET} PUBLIC
     ${MICROPY_INC_CORE}
     ${MICROPY_INC_USERMOD}
@@ -135,3 +141,5 @@ include(${MICROPY_DIR}/py/mkrules.cmake)
 #target_include_directories(${MICROPY_TARGET} usermod)
 
 project(micropython) # bouffalo_sdk does stuffs here
+
+# Disable some warnings to keep the build output clean.
