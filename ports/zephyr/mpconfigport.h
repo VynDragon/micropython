@@ -36,6 +36,26 @@
 #define MICROPY_HEAP_SIZE (16 * 1024)
 #endif
 
+#if defined(CONFIG_RISCV) && !defined(CONFIG_64BIT)
+#define MICROPY_EMIT_RV32                   (1)
+#elif defined(CONFIG_X86) && !defined(CONFIG_64BIT)
+#define MICROPY_EMIT_X86                    (1)
+#elif (defined(CONFIG_X86) && defined(CONFIG_64BIT)) || defined(CONFIG_X86_64)
+#define MICROPY_EMIT_X64                    (1)
+#elif defined(CONFIG_ARM)
+#define MICROPY_EMIT_ARM                    (1)
+#elif defined(CONFIG_XTENSA)
+#define MICROPY_EMIT_XTENSAWIN              (1)
+#define MICROPY_GCREGS_SETJMP               (1)
+#endif
+
+
+#define MICROPY_CONFIG_ROM_LEVEL            (MICROPY_CONFIG_ROM_LEVEL_EXTRA_FEATURES)
+
+#define MICROPY_PERSISTENT_CODE_LOAD        (1)
+#define MICROPY_PY_FRAMEBUF                 (1)
+#define SSIZE_MAX                           INT_MAX
+
 #define MICROPY_ENABLE_SOURCE_LINE  (1)
 #define MICROPY_STACK_CHECK         (1)
 #define MICROPY_ENABLE_GC           (1)
@@ -43,32 +63,31 @@
 #define MICROPY_HELPER_REPL         (1)
 #define MICROPY_REPL_AUTO_INDENT    (1)
 #define MICROPY_KBD_EXCEPTION       (1)
-#define MICROPY_PY_ASYNC_AWAIT      (0)
-#define MICROPY_PY_BUILTINS_BYTES_HEX (1)
-#define MICROPY_PY_BUILTINS_FILTER  (0)
-#define MICROPY_PY_BUILTINS_MIN_MAX (0)
-#define MICROPY_PY_BUILTINS_PROPERTY (0)
-#define MICROPY_PY_BUILTINS_RANGE_ATTRS (0)
-#define MICROPY_PY_BUILTINS_REVERSED (0)
-#define MICROPY_PY_BUILTINS_STR_COUNT (0)
-#define MICROPY_PY_BUILTINS_MEMORYVIEW (1)
+
+#define MICROPY_CPYTHON_COMPAT      (1)
+
 #define MICROPY_PY_BUILTINS_HELP    (1)
 #define MICROPY_PY_BUILTINS_HELP_TEXT zephyr_help_text
-#define MICROPY_PY_ARRAY            (0)
-#define MICROPY_PY_COLLECTIONS      (0)
-#define MICROPY_PY_CMATH            (0)
-#define MICROPY_PY_IO               (0)
-#define MICROPY_PY_MICROPYTHON_MEM_INFO (1)
+
+#define MICROPY_PY_BUILTINS_FILTER     (1)
+#define MICROPY_PY_BUILTINS_MEMORYVIEW (1)
+#define MICROPY_PY_BUILTINS_MIN_MAX    (1)
+#define MICROPY_PY_ASYNC_AWAIT         (1)
+#define MICROPY_PY_BUILTINS_REVERSED   (1)
+#define MICROPY_PY_SELECT              (1)
+#define MICROPY_PY_OS_UNAME            (1)
+
 #define MICROPY_PY_MACHINE          (1)
 #define MICROPY_PY_MACHINE_INCLUDEFILE "ports/zephyr/modmachine.c"
+#define MICROPY_PY_MACHINE_UART     (1)
+#define MICROPY_PY_MACHINE_UART_INCLUDEFILE "ports/zephyr/machine_uart.c"
 #define MICROPY_PY_MACHINE_I2C      (1)
 #define MICROPY_PY_MACHINE_SPI      (1)
 #define MICROPY_PY_MACHINE_SPI_MSB (SPI_TRANSFER_MSB)
 #define MICROPY_PY_MACHINE_SPI_LSB (SPI_TRANSFER_LSB)
 #define MICROPY_PY_MACHINE_PIN_MAKE_NEW mp_pin_make_new
-#define MICROPY_PY_MACHINE_UART     (1)
-#define MICROPY_PY_MACHINE_UART_INCLUDEFILE "ports/zephyr/machine_uart.c"
-#define MICROPY_PY_STRUCT           (0)
+
+
 #ifdef CONFIG_NETWORKING
 // If we have networking, we likely want errno comfort
 #define MICROPY_PY_ERRNO            (1)
@@ -81,18 +100,11 @@
 #endif
 #define MICROPY_PY_BLUETOOTH_ENABLE_GATT_CLIENT (0)
 #endif
-#define MICROPY_PY_BINASCII         (1)
-#define MICROPY_PY_HASHLIB          (1)
-#define MICROPY_PY_OS               (1)
-#define MICROPY_PY_TIME             (1)
-#define MICROPY_PY_TIME_TIME_TIME_NS (1)
 #define MICROPY_PY_TIME_INCLUDEFILE "ports/zephyr/modtime.c"
 #define MICROPY_PY_ZEPHYR           (1)
 #define MICROPY_PY_ZSENSOR          (1)
-#define MICROPY_PY_SYS_MODULES      (0)
-#define MICROPY_LONGINT_IMPL        (MICROPY_LONGINT_IMPL_MPZ)
+#define MICROPY_LONGINT_IMPL (MICROPY_LONGINT_IMPL_MPZ)
 #define MICROPY_FLOAT_IMPL (MICROPY_FLOAT_IMPL_FLOAT)
-#define MICROPY_PY_BUILTINS_COMPLEX (0)
 #define MICROPY_ENABLE_SCHEDULER    (1)
 #define MICROPY_VFS                 (1)
 #define MICROPY_READER_VFS          (MICROPY_VFS)

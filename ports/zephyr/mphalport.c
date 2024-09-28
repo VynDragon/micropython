@@ -26,6 +26,7 @@
 
 #include "py/runtime.h"
 #include "py/mphal.h"
+#include "py/stream.h"
 
 static struct k_poll_signal wait_signal;
 static struct k_poll_event wait_events[2] = {
@@ -74,4 +75,16 @@ void mp_hal_wait_sem(struct k_sem *sem, uint32_t timeout_ms) {
             return;
         }
     }
+}
+
+uintptr_t mp_hal_stdio_poll(uintptr_t poll_flags) {
+    uintptr_t ret = 0;
+
+    if ((poll_flags & MP_STREAM_POLL_RD)) {
+        ret |= MP_STREAM_POLL_RD;
+    }
+    if (poll_flags & MP_STREAM_POLL_WR) {
+        ret |= MP_STREAM_POLL_WR;
+    }
+    return ret;
 }

@@ -34,6 +34,8 @@ set(MICROPY_TARGET      micropython)
 include(${MICROPY_DIR}/py/py.cmake)
 include(${MICROPY_DIR}/extmod/extmod.cmake)
 
+set(MICROPY_FROZEN_MANIFEST ${CMAKE_CURRENT_LIST_DIR}/boards/manifest.py)
+
 set(MICROPY_SOURCE_PORT
     main.c
     help.c
@@ -61,6 +63,7 @@ set(MICROPY_SOURCE_SHARED
     runtime/pyexec.c
     runtime/stdout_helpers.c
     timeutils/timeutils.c
+    runtime/sys_stdio_mphal.c
 )
 list(TRANSFORM MICROPY_SOURCE_SHARED PREPEND ${MICROPY_DIR}/shared/)
 
@@ -114,9 +117,10 @@ zephyr_library_compile_definitions(
 zephyr_library_sources(${MICROPY_SOURCE_QSTR})
 zephyr_library_link_libraries(kernel)
 
-add_dependencies(${MICROPY_TARGET} zephyr_generated_headers)
-
 include(${MICROPY_DIR}/py/mkrules.cmake)
+
+add_dependencies(BUILD_VERSION_HEADER zephyr_generated_headers)
+add_dependencies(${MICROPY_TARGET} zephyr_generated_headers)
 
 target_sources(app PRIVATE
     src/zephyr_start.c

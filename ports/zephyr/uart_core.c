@@ -27,6 +27,7 @@
 #include "py/mpconfig.h"
 #include "py/runtime.h"
 #include "src/zephyr_getchar.h"
+#include "shared/runtime/interrupt_char.h"
 // Zephyr headers
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -92,6 +93,65 @@ mp_uint_t mp_hal_stdout_tx_strn(const char *str, mp_uint_t len) {
 
 #ifdef CONFIG_CONSOLE_SUBSYS
 
+/* functions modified from tty.c due to not being overridable */
+static int tty_irq_input_hook(struct tty_serial *tty, uint8_t c)
+{
+    int rx_next = tty->rx_put + 1;
+
+    if (rx_next >= tty->rx_ringbuf_sz) {
+        rx_next = 0;
+    }
+
+    if (rx_next == tty->rx_get) {
+        /* Try to give a clue to user that some input was lost */
+        tty_write(tty, '~', 1);
+        return 1;
+    }
+
+    tty->rx_ringbuf[tty->rx_put] = c;
+    tty->rx_put = rx_next;
+    k_sem_give(&tty->rx_sem);
+
+    return 1;
+}
+
+static void tty_uart_isr(const struct device *dev, void *user_data)
+{
+    struct tty_serial *tty = user_data;
+
+    uart_irq_update(dev);
+
+    if (uart_irq_rx_ready(dev)) {
+        uint8_t c;
+
+        while (1) {
+            if (uart_fifo_read(dev, &c, 1) == 0) {
+                break;
+            }
+            if (c == mp_interrupt_char) {
+                mp_sched_keyboard_interrupt();
+            } else {
+                tty_irq_input_hook(tty, c);
+            }
+        }
+    }
+
+    if (uart_irq_tx_ready(dev)) {
+        if (tty->tx_get == tty->tx_put) {
+            /* Output buffer empty, don't bother
+            * us with tx interrupts
+            */
+            uart_irq_tx_disable(dev);
+        } else {
+            uart_fifo_fill(dev, &tty->tx_ringbuf[tty->tx_get++], 1);
+            if (tty->tx_get >= tty->tx_ringbuf_sz) {
+                tty->tx_get = 0U;
+            }
+            k_sem_give(&tty->tx_sem);
+        }
+    }
+}
+
 int mp_console_init(void) {
 
     const struct device *uart_dev;
@@ -122,6 +182,9 @@ int mp_console_init(void) {
 
     tty_set_rx_timeout(&mp_console_serial, 0);
     tty_set_tx_timeout(&mp_console_serial, 1);
+
+    /* overwrite tty callback with ours */
+    uart_irq_callback_user_data_set(uart_dev, tty_uart_isr, &mp_console_serial);
 
     return 0;
 }
