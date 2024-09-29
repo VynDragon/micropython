@@ -35,6 +35,7 @@
 #include <zephyr/shell/shell_uart.h>
 
 #include "modzephyr.h"
+#include "zephyr_blkdevs.h"
 #include "py/runtime.h"
 
 static mp_obj_t mod_is_preempt_thread(void) {
@@ -79,6 +80,9 @@ static const mp_rom_map_elem_t mp_module_time_globals_table[] = {
     #endif
     #ifdef CONFIG_FLASH_MAP
     { MP_ROM_QSTR(MP_QSTR_FlashArea), MP_ROM_PTR(&zephyr_flash_area_type) },
+    #endif
+    #if MICROPY_VFS
+    { MP_ROM_QSTR(MP_QSTR_BlockDevicesID), MP_ROM_PTR(&zephyr_blkdevs_globals) },
     #endif
 };
 

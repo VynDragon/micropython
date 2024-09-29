@@ -104,7 +104,7 @@ static int tty_irq_input_hook(struct tty_serial *tty, uint8_t c)
 
     if (rx_next == tty->rx_get) {
         /* Try to give a clue to user that some input was lost */
-        tty_write(tty, '~', 1);
+        tty_write(tty, "~", 1);
         return 1;
     }
 

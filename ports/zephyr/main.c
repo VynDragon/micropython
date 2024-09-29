@@ -89,31 +89,6 @@ void init_zephyr(void) {
     #endif
 }
 
-#if MICROPY_VFS
-static void vfs_init(void) {
-    mp_obj_t bdev = NULL;
-    mp_obj_t mount_point;
-    const char *mount_point_str = NULL;
-    int ret = 0;
-
-    #ifdef CONFIG_DISK_DRIVER_SDMMC
-    mp_obj_t args[] = { mp_obj_new_str_from_cstr(CONFIG_SDMMC_VOLUME_NAME) };
-    bdev = MP_OBJ_TYPE_GET_SLOT(&zephyr_disk_access_type, make_new)(&zephyr_disk_access_type, ARRAY_SIZE(args), 0, args);
-    mount_point_str = "/sd";
-    #elif defined(CONFIG_FLASH_MAP) && FIXED_PARTITION_EXISTS(storage_partition)
-    mp_obj_t args[] = { MP_OBJ_NEW_SMALL_INT(FIXED_PARTITION_ID(storage_partition)), MP_OBJ_NEW_SMALL_INT(4096) };
-    bdev = MP_OBJ_TYPE_GET_SLOT(&zephyr_flash_area_type, make_new)(&zephyr_flash_area_type, ARRAY_SIZE(args), 0, args);
-    mount_point_str = "/flash";
-    #endif
-
-    if ((bdev != NULL)) {
-        mount_point = mp_obj_new_str_from_cstr(mount_point_str);
-        ret = mp_vfs_mount_and_chdir_protected(bdev, mount_point);
-        // TODO: if this failed, make a new file system and try to mount again
-    }
-}
-#endif // MICROPY_VFS
-
 int real_main(void) {
     volatile int stack_dummy = 0;
 
@@ -138,11 +113,12 @@ soft_reset:
     usb_enable(NULL);
     #endif
 
-    #if MICROPY_VFS
-    vfs_init();
+    #if MICROPY_MODULE_FROZEN
+    pyexec_frozen_module("_boot.py", false);
     #endif
 
     #if MICROPY_MODULE_FROZEN || MICROPY_VFS
+    pyexec_file_if_exists("boot.py");
     pyexec_file_if_exists("main.py");
     #endif
 
