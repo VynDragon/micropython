@@ -244,9 +244,6 @@ static const mp_rom_map_elem_t zephyr_flash_area_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_readblocks), MP_ROM_PTR(&zephyr_flash_area_readblocks_obj) },
     { MP_ROM_QSTR(MP_QSTR_writeblocks), MP_ROM_PTR(&zephyr_flash_area_writeblocks_obj) },
     { MP_ROM_QSTR(MP_QSTR_ioctl), MP_ROM_PTR(&zephyr_flash_area_ioctl_obj) },
-    #if FIXED_PARTITION_EXISTS(storage_partition)
-    { MP_ROM_QSTR(MP_QSTR_STORAGE), MP_ROM_INT(FIXED_PARTITION_ID(storage_partition)) },
-    #endif
 };
 static MP_DEFINE_CONST_DICT(zephyr_flash_area_locals_dict, zephyr_flash_area_locals_dict_table);
 
