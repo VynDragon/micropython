@@ -128,6 +128,22 @@ void mp_emit_glue_assign_native(mp_raw_code_t *rc, mp_raw_code_kind_t kind, cons
     #endif
     #endif
 
+    /* Some RISCV MCUs need their cache flushed, some dont,
+     * this is for flushing T-HEAD cores that support XTHEADCMO if needed
+     */
+    #if defined(MICROPY_EMIT_RV32_XTHEADCMO_NEEDSFLUSH)
+    __asm__ volatile (
+        "fence\n"
+        "fence.i\n"
+        /* th.dcache.iall*/
+        ".insn 0x10000B\n"
+        /* th.icache.iall */
+        ".insn 0x100000B\n"
+        "fence\n"
+        "fence.i\n"
+    );
+    #endif
+
     rc->kind = kind;
     rc->is_generator = (scope_flags & MP_SCOPE_FLAG_GENERATOR) != 0;
     rc->fun_data = fun_data;
