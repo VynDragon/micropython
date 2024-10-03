@@ -37,7 +37,10 @@
 #endif
 
 #if defined(CONFIG_RISCV) && !defined(CONFIG_64BIT)
-#define MICROPY_EMIT_RV32                   (1)
+#define MICROPY_EMIT_RV32                       (1)
+#if defined(DT_COMPAT_HAS_OKAY_xuantie_e907)
+#define MICROPY_EMIT_RV32_XTHEADCMO_NEEDSFLUSH  (1)
+#endif
 #elif defined(CONFIG_X86) && !defined(CONFIG_64BIT)
 #define MICROPY_EMIT_X86                    (1)
 #elif (defined(CONFIG_X86) && defined(CONFIG_64BIT)) || defined(CONFIG_X86_64)
@@ -48,7 +51,6 @@
 #define MICROPY_EMIT_XTENSAWIN              (1)
 #define MICROPY_GCREGS_SETJMP               (1)
 #endif
-
 
 #define MICROPY_CONFIG_ROM_LEVEL            (MICROPY_CONFIG_ROM_LEVEL_EXTRA_FEATURES)
 
@@ -73,6 +75,7 @@
 #define MICROPY_PY_BUILTINS_MEMORYVIEW (1)
 #define MICROPY_PY_BUILTINS_MIN_MAX    (1)
 #define MICROPY_PY_ASYNC_AWAIT         (1)
+#define MICROPY_PY_ASYNCIO             (1)
 #define MICROPY_PY_BUILTINS_REVERSED   (1)
 #define MICROPY_PY_SELECT              (1)
 #define MICROPY_PY_OS_UNAME            (1)
@@ -87,6 +90,9 @@
 #define MICROPY_PY_MACHINE_SPI_LSB (SPI_TRANSFER_LSB)
 #define MICROPY_PY_MACHINE_PIN_MAKE_NEW mp_pin_make_new
 
+
+#define MICROPY_PY_SYS              (1)
+#define MICROPY_PY_SYS_STDFILES     (1)
 
 #ifdef CONFIG_NETWORKING
 // If we have networking, we likely want errno comfort
@@ -144,6 +150,9 @@ void mp_hal_signal_event(void);
 #else
 #define MICROPY_HW_MCU_NAME "unknown-cpu"
 #endif
+
+#define MICROPY_HW_USB_VID  (0x1209)
+#define MICROPY_HW_USB_PID  (0xADDA)
 
 typedef int mp_int_t; // must be pointer size
 typedef unsigned mp_uint_t; // must be pointer size
