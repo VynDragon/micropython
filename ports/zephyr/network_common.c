@@ -26,10 +26,12 @@
 
 #include "py/mpconfig.h"
 
-#if MICROPY_PY_NETWORK
+#if MICROPY_PY_ZEPHYR_NETWORK
 
 #include <zephyr/kernel.h>
 #include <zephyr/net/net_if.h>
+#include <zephyr/net/dhcpv4_server.h>
+#include <zephyr/net/dhcpv6_server.h>
 
 #include "py/obj.h"
 #include "py/objstr.h"
@@ -37,11 +39,13 @@
 #include "py/parsenum.h"
 #include "py/mperrno.h"
 
-#include "extmod/modnetwork.h"
-
 #include "shared/netutils/netutils.h"
 
 #include "modnetwork.h"
+
+/* Atomic bits identifiers */
+#define NETWORK_ZEPHYR_STATE_DHCPV4_EN	0
+#define NETWORK_ZEPHYR_STATE_DHCPV6_EN	1
 
 static mp_obj_t network_zephyr_ifconfig(size_t n_args, const mp_obj_t *arg)
 {
@@ -167,8 +171,8 @@ static mp_obj_t network_zephyr_ipconfig(size_t n_args, const mp_obj_t *args, mp_
             for (int i = 0; i < NET_IF_MAX_IPV6_ADDR; i++) {
                 if (cfg->ip.ipv6->unicast[i].is_used) {
                     struct net_in6_addr addr = cfg->ip.ipv6->unicast[0].address.net_in6_addr;
-                    char buff[48];
-                    if (net_addr_ntop(NET_AF_INET6, &addr, buff, 48) == NULL) {
+                    char buff[NET_IPV6_ADDR_LEN];
+                    if (net_addr_ntop(NET_AF_INET6, &addr, buff, NET_IPV6_ADDR_LEN) == NULL) {
                         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("failed to convert ip to string"));
                     }
                     int addr_state = 0x0;
@@ -424,5 +428,114 @@ mp_obj_t network_zephyr_status_handler(size_t n_args, const mp_obj_t *args) {
 
     return mp_const_none;
 }
+
+#ifdef CONFIG_NET_DHCPV4_SERVER
+static mp_obj_t network_zephyr_dhcp4_server(size_t n_args, const mp_obj_t *args) {
+    network_zephyr_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    if (n_args == 1) {
+        if (atomic_test_bit(&self->state, NETWORK_ZEPHYR_STATE_DHCPV4_EN)) {
+            return mp_const_true;
+        } else {
+            return mp_const_false;
+        }
+    }
+
+    struct net_if_config *cfg = net_if_get_config(self->net_if);
+
+    if (mp_obj_is_true(args[1])) {
+        if (cfg->ip.ipv4 == NULL) {
+            mp_raise_ValueError(MP_ERROR_TEXT("no IPv4 address to use for DHCP server"));
+        }
+
+        struct in_addr *in_addr = NULL;
+        for (int i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
+            struct net_if_addr *ifaddr = &cfg->ip.ipv4->unicast[i].ipv4;
+            if (!ifaddr->is_used) {
+                continue;
+            } else {
+                in_addr = &ifaddr->address.in_addr;
+                break;
+            }
+        }
+
+        if (in_addr == NULL) {
+            mp_raise_ValueError(MP_ERROR_TEXT("no IPv4 address to use for DHCP server"));
+        }
+
+        /* Copy to not overwrite */
+        struct in_addr addr = *in_addr;
+
+        net_if_ipv4_set_gw(self->net_if, &addr);
+        addr.s4_addr[3] += 10; /* Starting IPv4 address for DHCPv4 address pool. */
+
+        int ret = net_dhcpv4_server_start(self->net_if, &addr);
+        if (ret == -EALREADY) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("IPv4 DHCP server is already started"));
+        }
+        if (ret != 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("failed to start IPv4 DHCP server: %d"), ret);
+        }
+        atomic_set_bit(&self->state, NETWORK_ZEPHYR_STATE_DHCPV4_EN);
+    } else {
+        int ret = net_dhcpv4_server_stop(self->net_if);
+        if (ret != 0 && ret != -ENOENT) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("failed to stop IPv4 DHCP server: %d"), ret);
+        }
+        atomic_clear_bit(&self->state, NETWORK_ZEPHYR_STATE_DHCPV4_EN);
+    }
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_zephyr_dhcp4_server_obj, 1, 2, network_zephyr_dhcp4_server);
+#endif
+
+#ifdef CONFIG_NET_DHCPV6_SERVER
+static mp_obj_t network_zephyr_dhcp6_server(size_t n_args, const mp_obj_t *args) {
+    network_zephyr_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    if (n_args == 1) {
+        if (atomic_test_bit(&self->state, NETWORK_ZEPHYR_STATE_DHCPV6_EN)) {
+            return mp_const_true;
+        } else {
+            return mp_const_false;
+        }
+    }
+
+    if (mp_obj_is_true(args[1])) {
+        /* From dhcp6_pd sample */
+        struct net_dhcpv6_server_params params = {
+            /* 2001:db8:beef::/56, 2001:db8:beef:100::/56, ... */
+            .prefix = { { { 0x20, 0x01, 0x0d, 0xb8, 0xbe, 0xef, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0 } } },
+            .prefix_len = 56,
+            /* 2001:db8:abcd::1, 2001:db8:abcd::2, ... */
+            .addr = { { { 0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0, 0,
+                            0, 0, 0, 0, 0, 0, 0, 0 } } },
+            .offer_addr = true,
+            .offer_prefix = true,
+        };
+        int ret = net_dhcpv6_server_start(self->net_if, &params);
+        if (ret == -EALREADY) {
+            mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("IPv6 DHCP server is already started"));
+        }
+        if (ret != 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("failed to start IPv6 DHCP server: %d"), ret);
+        }
+        atomic_set_bit(&self->state, NETWORK_ZEPHYR_STATE_DHCPV6_EN);
+    } else {
+        int ret = net_dhcpv6_server_stop(self->net_if);
+        if (ret != 0 && ret != -ENOENT) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("failed to stop IPv6 DHCP server: %d"), ret);
+        }
+        atomic_clear_bit(&self->state, NETWORK_ZEPHYR_STATE_DHCPV6_EN);
+    }
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_zephyr_dhcp6_server_obj, 1, 2, network_zephyr_dhcp6_server);
+#endif
 
 #endif /* MICROPY_PY_NETWORK */

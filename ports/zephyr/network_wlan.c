@@ -24,16 +24,21 @@
  * THE SOFTWARE.
  */
 
+#include "py/mpconfig.h"
+
+#if MICROPY_PY_ZEPHYR_NETWORK_WLAN
+
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/net/wifi.h>
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/wifi_utils.h>
 #include <zephyr/sys/atomic.h>
 
-#include "modnetwork.h"
 #include "py/runtime.h"
 #include "py/objlist.h"
 #include "py/objstr.h"
+
+#include "modnetwork.h"
 
 #define ZEPHYR_WLAN_STA_CONNECT_TIMEOUT_S   30
 #define ZEPHYR_WLAN_STA_SCAN_TIMEOUT_MS     10000
@@ -56,6 +61,7 @@
 #define ZEPHYR_WLAN_STATE_STA_FAIL	3
 #define ZEPHYR_WLAN_STATE_STA_BADPW	4
 #define ZEPHYR_WLAN_STATE_STA_BADAP	5
+#define ZEPHYR_WLAN_STATE_AP_UP         6
 #define ZEPHYR_WLAN_STATE_DELETED       7
 
 #define WIFI_FREQ_BAND_ALL \
@@ -141,6 +147,93 @@ static enum wifi_frequency_bandwidths zephyr_wlan_bandwidth(int in) {
         return in;
     }
 }
+
+static void zephyr_wlan_updown(zephyr_wlan_obj_t *self, bool up)
+{
+    if (up) {
+        if (!net_if_is_admin_up(self->nic.net_if)) {
+            int ret = net_if_up(self->nic.net_if);
+            if (ret != 0) {
+                mp_raise_msg_varg(&mp_type_RuntimeError,
+                    MP_ERROR_TEXT("failed to bring interface up: %d"), ret);
+            }
+        }
+        struct wifi_ps_params ps = {0};
+        ps.enabled = WIFI_PS_DISABLED;
+        ps.type = WIFI_PS_PARAM_STATE;
+
+        int ret = net_mgmt(NET_REQUEST_WIFI_PS, self->nic.net_if, &ps, sizeof(ps));
+        if (ret != 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("failed to disable power save: %d"), ret);
+        }
+        atomic_set_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE);
+    } else {
+        struct wifi_ps_params ps = {0};
+        ps.enabled = WIFI_PS_ENABLED;
+        ps.type = WIFI_PS_PARAM_STATE;
+
+        int ret = net_mgmt(NET_REQUEST_WIFI_PS, self->nic.net_if, &ps, sizeof(ps));
+        if (ret != 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError,
+                MP_ERROR_TEXT("failed to enable power save: %d"), ret);
+        }
+        if (net_if_is_admin_up(self->nic.net_if)) {
+            int ret = net_if_down(self->nic.net_if);
+            if (ret != 0) {
+                mp_raise_msg_varg(&mp_type_RuntimeError,
+                    MP_ERROR_TEXT("failed to bring interface down: %d"), ret);
+            }
+        }
+        atomic_clear_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE);
+    }
+}
+
+static inline void zephyr_wlan_ready(zephyr_wlan_obj_t *self)
+{
+    if (!atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE)) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("interface is not active"));
+    }
+}
+
+#ifdef CONFIG_WIFI_MGMT_RAW_SCAN_RESULTS
+/* From WiFi shell sample */
+static int wifi_freq_to_channel(int frequency)
+{
+    int channel;
+
+    if (frequency == 2484) { /* channel 14 */
+        channel = 14;
+    } else if ((frequency <= 2472) && (frequency >= 2412)) {
+        channel = ((frequency - 2412) / 5) + 1;
+    } else if ((frequency <= 5320) && (frequency >= 5180)) {
+        channel = ((frequency - 5180) / 5) + 36;
+    } else if ((frequency <= 5720) && (frequency >= 5500)) {
+        channel = ((frequency - 5500) / 5) + 100;
+    } else if ((frequency <= 5895) && (frequency >= 5745)) {
+        channel = ((frequency - 5745) / 5) + 149;
+    } else {
+        channel = frequency;
+    }
+
+    return channel;
+}
+/* That too */
+static enum wifi_frequency_bands wifi_freq_to_band(int frequency)
+{
+    enum wifi_frequency_bands band = WIFI_FREQ_BAND_2_4_GHZ;
+
+    if ((frequency >= 2401) && (frequency <= 2495)) {
+        band = WIFI_FREQ_BAND_2_4_GHZ;
+    } else if ((frequency >= 5170) && (frequency <= 5895)) {
+        band = WIFI_FREQ_BAND_5_GHZ;
+    } else {
+        band = WIFI_FREQ_BAND_6_GHZ;
+    }
+
+    return band;
+}
+#endif
 
 #ifdef CONFIG_HWINFO
 static uint8_t *zephyr_wlan_mac(void) {
@@ -274,10 +367,10 @@ static void zephyr_wlan_event_handler(struct net_mgmt_event_callback *cb, uint64
 
     switch (mgmt_event) {
     case NET_EVENT_WIFI_AP_DISABLE_RESULT:
-        atomic_clear_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE);
+        atomic_clear_bit(&self->state, ZEPHYR_WLAN_STATE_AP_UP);
         break;
     case NET_EVENT_WIFI_AP_ENABLE_RESULT:
-        atomic_set_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE);
+        atomic_set_bit(&self->state, ZEPHYR_WLAN_STATE_AP_UP);
         break;
     case NET_EVENT_WIFI_AP_STA_CONNECTED: {
         zephyr_wlan_event_handler_offload(self, mgmt_event, cb->info, sizeof(struct wifi_ap_sta_info));
@@ -366,12 +459,13 @@ static mp_obj_t network_zephyr_wlan_make_new(const mp_obj_type_t *type, size_t n
     mp_obj_t obj = MP_OBJ_FROM_PTR(self);
 
     self->nic.net_if = net_if;
+    network_zephyr_make_new(obj);
     atomic_clear(&self->state);
     k_fifo_init(&self->event_fifo);
     self->remote_sta_list = mp_obj_new_list(0, NULL);
     self->scan_list = mp_obj_new_list(0, NULL);
 
-    self->network.ssid = mp_obj_new_str_from_cstr(MICROPY_PY_NETWORK_HOSTNAME_DEFAULT);
+    self->network.ssid = mp_obj_new_str_from_cstr(CONFIG_NET_HOSTNAME);
     self->network.password = mp_const_empty_bytes;
     self->network.band = WIFI_FREQ_BAND_2_4_GHZ;
     self->network.channel = WIFI_CHANNEL_ANY;
@@ -390,16 +484,16 @@ static mp_obj_t network_zephyr_wlan_make_new(const mp_obj_type_t *type, size_t n
     self->network.mac[5] = 0x55;
     #endif
 
-    if (n_args == 0 || args[ARG_type].u_int == MOD_NETWORK_STA_IF) {
-        atomic_clear_bit(&self->state, ZEPHYR_WLAN_STATE_AP);
-    } else {
-        atomic_set_bit(&self->state, ZEPHYR_WLAN_STATE_AP);
-    }
-
     net_mgmt_init_event_callback(&self->cb, zephyr_wlan_event_handler, ZEPHYR_WLAN_EVENT_MASK);
     net_mgmt_add_event_callback(&self->cb);
 
-    //mod_network_register_nic(obj);
+    if (n_args == 0 || args[ARG_type].u_int == MOD_NETWORK_STA_IF) {
+        atomic_clear_bit(&self->state, ZEPHYR_WLAN_STATE_AP);
+        /* Ready immediately */
+        zephyr_wlan_updown(self, true);
+    } else {
+        atomic_set_bit(&self->state, ZEPHYR_WLAN_STATE_AP);
+    }
 
     return obj;
 }
@@ -410,7 +504,10 @@ static mp_obj_t network_zephyr_wlan_deinit(mp_obj_t self_in) {
 
     if (!atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_DELETED)) {
         atomic_set_bit(&self->state, ZEPHYR_WLAN_STATE_DELETED);
+
         net_mgmt_del_event_callback(&self->cb);
+
+        zephyr_wlan_updown(self, false);
     }
     return mp_const_none;
 }
@@ -501,6 +598,9 @@ static mp_obj_t network_zephyr_wlan_active(size_t n_args, const mp_obj_t *args) 
 
     if (n_args > 1) {
         if (mp_obj_is_true(args[1])) {
+
+            zephyr_wlan_updown(self, true);
+
             /* Only trigger when activating in AP mode */
             if (atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_AP)) {
                 ret = network_zephyr_wlan_configure(self);
@@ -523,14 +623,16 @@ static mp_obj_t network_zephyr_wlan_active(size_t n_args, const mp_obj_t *args) 
                         MP_ERROR_TEXT("Failed to disconnect: %d"), ret);
                 }
             }
+            zephyr_wlan_updown(self, false);
         }
+    } else {
+        if (atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE)) {
+            return mp_const_true;
+        }
+        return mp_const_false;
     }
 
-    if (atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE)) {
-        return mp_const_true;
-    }
-
-    return mp_const_false;
+    return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_zephyr_wlan_active_obj, 1, 2, network_zephyr_wlan_active);
 
@@ -562,6 +664,8 @@ static mp_obj_t network_zephyr_wlan_scan(size_t n_args, const mp_obj_t *pos_args
         }
     }
 
+    zephyr_wlan_ready(self);
+
     self->scan_list = mp_obj_new_list(0, NULL);
 
     ret = net_mgmt(NET_REQUEST_WIFI_SCAN, self->nic.net_if, &params, sizeof(params));
@@ -570,10 +674,8 @@ static mp_obj_t network_zephyr_wlan_scan(size_t n_args, const mp_obj_t *pos_args
             MP_ERROR_TEXT("Failed to start scan: %d"), ret);
     }
 
-    MP_THREAD_GIL_EXIT();
     ret = net_mgmt_event_wait_on_iface(self->nic.net_if, NET_EVENT_WIFI_SCAN_DONE, NULL, NULL, 0,
         K_MSEC(ZEPHYR_WLAN_STA_SCAN_TIMEOUT_MS));
-    MP_THREAD_GIL_ENTER();
     if (ret == -ETIMEDOUT) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Scan timed out"));
     } else if (ret != 0) {
@@ -624,7 +726,7 @@ static mp_obj_t network_zephyr_wlan_connect(size_t n_args, const mp_obj_t *pos_a
 
     if (args[ARG_key_pbkdf2].u_obj != MP_OBJ_NULL) {
         if (!mp_obj_is_str_or_bytes(args[ARG_key_pbkdf2].u_obj)
-            || mp_obj_get_int(mp_obj_len(args[ARG_key_pbkdf2].u_obj)) != 32) {
+            || mp_obj_get_int(mp_obj_len(args[ARG_key_pbkdf2].u_obj)) != WIFI_PSK_PBKDF2_KEY_LEN) {
             mp_raise_TypeError(MP_ERROR_TEXT("PBKDF2 key must be 32 bytes"));
         }
         if (args[ARG_key_pbkdf2].u_obj != MP_OBJ_NULL && args[ARG_key].u_obj != MP_OBJ_NULL) {
@@ -633,6 +735,8 @@ static mp_obj_t network_zephyr_wlan_connect(size_t n_args, const mp_obj_t *pos_a
     }
 
     zephyr_wlan_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+
+    zephyr_wlan_ready(self);
 
     atomic_clear_bit(&self->state, ZEPHYR_WLAN_STATE_STA_BADAP);
 
@@ -737,8 +841,6 @@ static mp_obj_t network_zephyr_wlan_connect(size_t n_args, const mp_obj_t *pos_a
             MP_ERROR_TEXT("Failed to configure network: %d"), ret);
     }
 
-    atomic_set_bit(&self->state, ZEPHYR_WLAN_STATE_ACTIVE);
-
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(network_zephyr_wlan_connect_obj, 1, network_zephyr_wlan_connect);
@@ -746,6 +848,8 @@ static MP_DEFINE_CONST_FUN_OBJ_KW(network_zephyr_wlan_connect_obj, 1, network_ze
 static mp_obj_t network_zephyr_wlan_disconnect(mp_obj_t self_in) {
     zephyr_wlan_obj_t *self = MP_OBJ_TO_PTR(self_in);
     int ret;
+
+    zephyr_wlan_ready(self);
 
     ret = net_mgmt(NET_REQUEST_WIFI_DISCONNECT, self->nic.net_if, NULL, 0);
     if (ret == -EALREADY || !atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_STA_CONNECTED)) {
@@ -756,10 +860,8 @@ static mp_obj_t network_zephyr_wlan_disconnect(mp_obj_t self_in) {
             MP_ERROR_TEXT("Failed to disconnect: %d"), ret);
     }
 
-    MP_THREAD_GIL_EXIT();
     ret = net_mgmt_event_wait_on_iface(self->nic.net_if, NET_EVENT_WIFI_DISCONNECT_RESULT,
         NULL, NULL, 0, K_SECONDS(ZEPHYR_WLAN_STA_CONNECT_TIMEOUT_S));
-    MP_THREAD_GIL_ENTER();
     mp_handle_pending(true);
     if (ret == -ETIMEDOUT) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Disconnection timed out"));
@@ -882,53 +984,102 @@ static mp_obj_t network_zephyr_wlan_config(size_t n_args, const mp_obj_t *args, 
     int ret;
 
     ret = net_mgmt(NET_REQUEST_WIFI_IFACE_STATUS, self->nic.net_if, &status, sizeof(struct wifi_iface_status));
-
     if (ret != 0) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to fetch status: %d"), ret);
-        return mp_const_none;
     }
 
-    switch (mp_obj_str_get_qstr(args[1])) {
-    #ifdef CONFIG_HWINFO
-    case MP_QSTR_mac:
-        return mp_obj_new_bytes(zephyr_wlan_mac(), WIFI_MAC_ADDR_LEN);
-    #else
-    case MP_QSTR_mac:
-    #endif
-    case MP_QSTR_bssid:
-        return mp_obj_new_bytes(status.bssid, WIFI_MAC_ADDR_LEN);
-    case MP_QSTR_ssid:
-    case MP_QSTR_essid:
-        return mp_obj_new_str_from_cstr(status.ssid);
-    case MP_QSTR_security:
-    case MP_QSTR_authmode:
-        return mp_obj_new_int(status.security);
-    case MP_QSTR_key:
-    case MP_QSTR_password:
-        return self->network.password;
-    case MP_QSTR_channel:
-        return mp_obj_new_int(status.channel);
-    case MP_QSTR_band:
-        return mp_obj_new_int(status.band);
-    case MP_QSTR_mode:
-        return mp_obj_new_int(status.iface_mode);
-    case MP_QSTR_link_mode:
-    case MP_QSTR_protocol:
-        return mp_obj_new_int(status.link_mode);
-    case MP_QSTR_pbkdf2:
-        if (self->network.password_is_pbkdf2) {
-            return mp_const_true;
-        } else {
-            return mp_const_false;
+    /* Live status */
+    if (atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_STA_CONNECTED) || atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_AP_UP)) {
+        switch (mp_obj_str_get_qstr(args[1])) {
+        #ifdef CONFIG_HWINFO
+        case MP_QSTR_mac:
+            return mp_obj_new_bytes(zephyr_wlan_mac(), WIFI_MAC_ADDR_LEN);
+        #else
+        case MP_QSTR_mac:
+        #endif
+        case MP_QSTR_bssid:
+            return mp_obj_new_bytes(status.bssid, WIFI_MAC_ADDR_LEN);
+        case MP_QSTR_ssid:
+        case MP_QSTR_essid:
+            return mp_obj_new_str_from_cstr(status.ssid);
+        case MP_QSTR_security:
+        case MP_QSTR_authmode:
+            return mp_obj_new_int(status.security);
+        case MP_QSTR_key:
+        case MP_QSTR_password:
+            return self->network.password;
+        case MP_QSTR_channel:
+            return mp_obj_new_int(status.channel);
+        case MP_QSTR_band:
+            return mp_obj_new_int(status.band);
+        case MP_QSTR_mode:
+            return mp_obj_new_int(status.iface_mode);
+        case MP_QSTR_link_mode:
+        case MP_QSTR_protocol:
+            return mp_obj_new_int(status.link_mode);
+        case MP_QSTR_pbkdf2:
+            if (self->network.password_is_pbkdf2) {
+                return mp_const_true;
+            } else {
+                return mp_const_false;
+            }
+        case MP_QSTR_hostname:
+        case MP_QSTR_dhcp_hostname: {
+            mp_raise_NotImplementedError(MP_ERROR_TEXT("interface hostname config is deprecated, use network module's"));
+            break;
         }
-    case MP_QSTR_hostname:
-    case MP_QSTR_dhcp_hostname: {
-        mp_raise_NotImplementedError(MP_ERROR_TEXT("interface hostname config is deprecated, use network module's"));
-        break;
-    }
-    default:
-        mp_raise_ValueError(MP_ERROR_TEXT("unexpected key"));
-        break;
+        default:
+            mp_raise_ValueError(MP_ERROR_TEXT("unexpected key"));
+            break;
+        }
+    /* Theorical status */
+    } else {
+        switch (mp_obj_str_get_qstr(args[1])) {
+        #ifdef CONFIG_HWINFO
+        case MP_QSTR_mac:
+            return mp_obj_new_bytes(zephyr_wlan_mac(), WIFI_MAC_ADDR_LEN);
+        #else
+        case MP_QSTR_mac:
+        #endif
+        case MP_QSTR_bssid:
+            return mp_obj_new_bytes(self->network.mac, WIFI_MAC_ADDR_LEN);
+        case MP_QSTR_ssid:
+        case MP_QSTR_essid:
+            return self->network.ssid;
+        case MP_QSTR_security:
+        case MP_QSTR_authmode:
+            return mp_obj_new_int(self->network.security);
+        case MP_QSTR_key:
+        case MP_QSTR_password:
+            return self->network.password;
+        case MP_QSTR_channel:
+            return mp_obj_new_int(self->network.channel);
+        case MP_QSTR_band:
+            return mp_obj_new_int(self->network.band);
+        case MP_QSTR_mode:
+            if (atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_AP)) {
+                return mp_obj_new_int(WIFI_MODE_INFRA);
+            } else {
+                return mp_obj_new_int(WIFI_MODE_AP);
+            }
+        case MP_QSTR_link_mode:
+        case MP_QSTR_protocol:
+            return mp_obj_new_int(WIFI_LINK_MODE_UNKNOWN);
+        case MP_QSTR_pbkdf2:
+            if (self->network.password_is_pbkdf2) {
+                return mp_const_true;
+            } else {
+                return mp_const_false;
+            }
+        case MP_QSTR_hostname:
+        case MP_QSTR_dhcp_hostname: {
+            mp_raise_NotImplementedError(MP_ERROR_TEXT("interface hostname config is deprecated, use network module's"));
+            break;
+        }
+        default:
+            mp_raise_ValueError(MP_ERROR_TEXT("unexpected key"));
+            break;
+        }
     }
 
     return mp_const_none;
@@ -944,7 +1095,6 @@ static mp_obj_t network_zephyr_wlan_status(size_t n_args, const mp_obj_t *args) 
 
     if (ret != 0) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to fetch status: %d"), ret);
-        return mp_const_none;
     }
 
     if (n_args == 1) {
@@ -1004,19 +1154,61 @@ static mp_obj_t network_zephyr_wlan_status(size_t n_args, const mp_obj_t *args) 
 
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_zephyr_wlan_status_obj, 1, 2, network_zephyr_wlan_status);
 
+/* Country code is per interface, only for RF */
+static mp_obj_t network_zephyr_wlan_country(size_t n_args, const mp_obj_t *args) {
+    network_zephyr_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    if (n_args == 1) {
+        struct wifi_reg_domain regd = { .oper = WIFI_MGMT_GET, .chan_info = NULL };
+        int ret = net_mgmt(NET_REQUEST_WIFI_REG_DOMAIN, self->net_if, &regd, sizeof(regd));
+        if (ret != 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("failed to get country code: %d"), ret);
+        }
+        return mp_obj_new_str(regd.country_code, 2);
+    } else {
+        size_t len;
+        const char *str = mp_obj_str_get_data(args[1], &len);
+        struct wifi_reg_domain regd = {
+            .oper = WIFI_MGMT_SET,
+            .force = true,
+        };
+        if (len != 2) {
+            mp_raise_ValueError(NULL);
+        }
+        regd.country_code[0] = str[0];
+        regd.country_code[1] = str[1];
+        int ret = net_mgmt(NET_REQUEST_WIFI_REG_DOMAIN, self->net_if, &regd, sizeof(regd));
+        if (ret != 0) {
+            mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("failed to set country code: %d"), ret);
+        }
+    }
+
+    return mp_const_none;
+}
+
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(network_zephyr_wlan_country_obj, 1, 2, network_zephyr_wlan_country);
+
 static const mp_rom_map_elem_t network_zephyr_wlan_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_active),		MP_ROM_PTR(&network_zephyr_wlan_active_obj) },
     { MP_ROM_QSTR(MP_QSTR_scan),		MP_ROM_PTR(&network_zephyr_wlan_scan_obj) },
     { MP_ROM_QSTR(MP_QSTR_connect),		MP_ROM_PTR(&network_zephyr_wlan_connect_obj) },
     { MP_ROM_QSTR(MP_QSTR_disconnect),		MP_ROM_PTR(&network_zephyr_wlan_disconnect_obj) },
     { MP_ROM_QSTR(MP_QSTR_isconnected),		MP_ROM_PTR(&network_zephyr_wlan_isconnected_obj) },
-    { MP_ROM_QSTR(MP_QSTR_ifconfig),		MP_ROM_PTR(&network_zephyr_ifconfig_obj) },
-    { MP_ROM_QSTR(MP_QSTR_ipconfig),		MP_ROM_PTR(&network_zephyr_ipconfig_obj) },
     { MP_ROM_QSTR(MP_QSTR_config),		MP_ROM_PTR(&network_zephyr_wlan_config_obj) },
     { MP_ROM_QSTR(MP_QSTR_status),		MP_ROM_PTR(&network_zephyr_wlan_status_obj) },
-    /* Desctructors */
+    { MP_ROM_QSTR(MP_QSTR_country),		MP_ROM_PTR(&network_zephyr_wlan_country_obj) },
+    /* Destructors */
     { MP_ROM_QSTR(MP_QSTR_deinit),		MP_ROM_PTR(&network_zephyr_wlan_deinit_obj) },
     { MP_ROM_QSTR(MP_QSTR___del__),		MP_ROM_PTR(&network_zephyr_wlan_deinit_obj) },
+    /* Commons */
+    { MP_ROM_QSTR(MP_QSTR_ifconfig),		MP_ROM_PTR(&network_zephyr_ifconfig_obj) },
+    { MP_ROM_QSTR(MP_QSTR_ipconfig),		MP_ROM_PTR(&network_zephyr_ipconfig_obj) },
+    #ifdef CONFIG_NET_DHCPV4_SERVER
+    { MP_ROM_QSTR(MP_QSTR_dhcp4_server),	MP_ROM_PTR(&network_zephyr_dhcp4_server_obj) },
+    #endif
+    #ifdef CONFIG_NET_DHCPV6_SERVER
+    { MP_ROM_QSTR(MP_QSTR_dhcp6_server),	MP_ROM_PTR(&network_zephyr_dhcp6_server_obj) },
+    #endif
 
     /* Security type constants matching ESP32 for convenience */
     { MP_ROM_QSTR(MP_QSTR_SEC_OPEN),		MP_ROM_INT(WIFI_SECURITY_TYPE_NONE) },
@@ -1084,3 +1276,5 @@ MP_DEFINE_CONST_OBJ_TYPE(
     make_new, network_zephyr_wlan_make_new,
     locals_dict, &network_zephyr_wlan_locals_dict
     );
+
+#endif /* MICROPY_PY_ZEPHYR_NETWORK_WLAN */

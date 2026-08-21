@@ -83,6 +83,8 @@ set(MICROPY_SOURCE_PORT
     zephyr_filesystem.c
     mpthreadport.c
     network_common.c
+    network_wlan.c
+    modnetwork.c
 )
 list(TRANSFORM MICROPY_SOURCE_PORT PREPEND ${MICROPY_PORT_DIR}/)
 
