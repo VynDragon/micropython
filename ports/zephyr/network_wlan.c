@@ -674,8 +674,10 @@ static mp_obj_t network_zephyr_wlan_scan(size_t n_args, const mp_obj_t *pos_args
             MP_ERROR_TEXT("Failed to start scan: %d"), ret);
     }
 
+    MP_THREAD_GIL_EXIT();
     ret = net_mgmt_event_wait_on_iface(self->nic.net_if, NET_EVENT_WIFI_SCAN_DONE, NULL, NULL, 0,
         K_MSEC(ZEPHYR_WLAN_STA_SCAN_TIMEOUT_MS));
+    MP_THREAD_GIL_ENTER();
     if (ret == -ETIMEDOUT) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Scan timed out"));
     } else if (ret != 0) {
@@ -854,20 +856,22 @@ static mp_obj_t network_zephyr_wlan_disconnect(mp_obj_t self_in) {
     ret = net_mgmt(NET_REQUEST_WIFI_DISCONNECT, self->nic.net_if, NULL, 0);
     if (ret == -EALREADY || !atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_STA_CONNECTED)) {
         return mp_const_none;
-    }
-    if (ret != 0) {
+    } else if (ret != 0) {
         mp_raise_msg_varg(&mp_type_RuntimeError,
             MP_ERROR_TEXT("Failed to disconnect: %d"), ret);
     }
 
+    MP_THREAD_GIL_EXIT();
     ret = net_mgmt_event_wait_on_iface(self->nic.net_if, NET_EVENT_WIFI_DISCONNECT_RESULT,
         NULL, NULL, 0, K_SECONDS(ZEPHYR_WLAN_STA_CONNECT_TIMEOUT_S));
-    mp_handle_pending(true);
+    MP_THREAD_GIL_ENTER();
     if (ret == -ETIMEDOUT) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Disconnection timed out"));
     } else if (ret != 0) {
         mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to disconnect: %d"), ret);
     }
+
+    mp_handle_pending(true);
 
     return mp_const_none;
 }

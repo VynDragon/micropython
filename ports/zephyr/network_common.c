@@ -472,8 +472,7 @@ static mp_obj_t network_zephyr_dhcp4_server(size_t n_args, const mp_obj_t *args)
         int ret = net_dhcpv4_server_start(self->net_if, &addr);
         if (ret == -EALREADY) {
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("IPv4 DHCP server is already started"));
-        }
-        if (ret != 0) {
+        } else if (ret != 0) {
             mp_raise_msg_varg(&mp_type_RuntimeError,
                 MP_ERROR_TEXT("failed to start IPv4 DHCP server: %d"), ret);
         }
@@ -519,8 +518,7 @@ static mp_obj_t network_zephyr_dhcp6_server(size_t n_args, const mp_obj_t *args)
         int ret = net_dhcpv6_server_start(self->net_if, &params);
         if (ret == -EALREADY) {
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("IPv6 DHCP server is already started"));
-        }
-        if (ret != 0) {
+        } else if (ret != 0) {
             mp_raise_msg_varg(&mp_type_RuntimeError,
                 MP_ERROR_TEXT("failed to start IPv6 DHCP server: %d"), ret);
         }
