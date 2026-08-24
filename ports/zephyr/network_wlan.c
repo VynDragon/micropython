@@ -99,6 +99,8 @@ typedef struct _zephyr_wlan_event_t {
     size_t info_len;
 } zephyr_wlan_event_t;
 
+/* Helper Functions ----------------------------------------------------------------------------- */
+
 static int zephyr_wlan_sec_to_mpy(enum wifi_security_type security) {
     switch(security) {
     case WIFI_SECURITY_TYPE_NONE:
@@ -246,6 +248,8 @@ static uint8_t *zephyr_wlan_mac(void) {
     return buf;
 }
 #endif
+
+/* Event Functions ------------------------------------------------------------------------------ */
 
 /* Handle offloaded foreign thread events in mpy context */
 static void zephyr_wlan_event_handler_offload_handler(mp_sched_node_t *node) {
@@ -415,6 +419,8 @@ static void zephyr_wlan_event_handler(struct net_mgmt_event_callback *cb, uint64
         mp_raise_NotImplementedError(MP_ERROR_TEXT("Unhandled WiFi Event type"));
     }
 }
+
+/* Methods -------------------------------------------------------------------------------------- */
 
 static mp_obj_t network_zephyr_wlan_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw,
     const mp_obj_t *all_args) {

@@ -102,12 +102,12 @@
 #endif
 #ifdef CONFIG_NETWORKING
 #define MICROPY_PY_SOCKET           (1)
-#ifdef CONFIG_WIFI
 #define MICROPY_PY_ZEPHYR_NETWORK   (1)
+#ifdef CONFIG_NET_SOCKETS_SOCKOPT_TLS
+#define MICROPY_PY_ZEPHYR_TLS       (1)
+#endif
+#ifdef CONFIG_WIFI
 #define MICROPY_PY_ZEPHYR_NETWORK_WLAN (1)
-#define MICROPY_PY_NETWORK_INCLUDEFILE "ports/zephyr/network_wlan.c"
-#define MICROPY_PORT_NETWORK_INTERFACES \
-	{ MP_ROM_QSTR(MP_QSTR_WLAN), MP_ROM_PTR(&mod_network_zephyr_wlan_type) },
 #define MICROPY_SCHEDULER_STATIC_NODES (1)
 #endif
 #endif

@@ -33,9 +33,10 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/posix/fcntl.h>
 
+#include "py/objstr.h"
+#include "py/parsenum.h"
 #include "py/runtime.h"
 #include "py/stream.h"
-#include "py/objstr.h"
 
 typedef enum _socket_obj_state_t {
     SOCK_STATE_NEW = 0,
@@ -261,8 +262,8 @@ static mp_obj_t socket_format_addr(const struct net_sockaddr *saddr_in) {
     #if defined(CONFIG_NET_IPV6)
     case NET_AF_INET6: {
         struct net_sockaddr_in6 *addr_sin = (struct net_sockaddr_in6 *)saddr_in;
-        char buf[NET_IPV4_ADDR_LEN];
-        if (net_addr_ntop(saddr_in->sa_family, &addr_sin->sin6_addr, buf, NET_IPV4_ADDR_LEN) == NULL) {
+        char buf[NET_IPV6_ADDR_LEN];
+        if (net_addr_ntop(saddr_in->sa_family, &addr_sin->sin6_addr, buf, NET_IPV6_ADDR_LEN) == NULL) {
             mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("failed to convert ip to string"));
         }
         mp_obj_tuple_t *tuple = mp_obj_new_tuple(4, NULL);
@@ -368,9 +369,9 @@ static mp_obj_t socket_make_new(const mp_obj_type_t *type, size_t n_args, size_t
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
-    socket_family_get_str(args[ARG_family].u_int);
+    (void)socket_family_get_str(args[ARG_family].u_int);
 
-    socket_type_get_str(args[ARG_type].u_int);
+    (void)socket_type_get_str(args[ARG_type].u_int);
 
     if (args[ARG_proto].u_int == -1) {
         args[ARG_proto].u_int = NET_IPPROTO_TCP;
@@ -378,7 +379,7 @@ static mp_obj_t socket_make_new(const mp_obj_type_t *type, size_t n_args, size_t
             args[ARG_proto].u_int = NET_IPPROTO_UDP;
         }
     } else {
-        socket_proto_get(args[ARG_proto].u_int);
+        (void)socket_proto_get(args[ARG_proto].u_int);
     }
 
     socket_obj_t *self = socket_new(NULL);
@@ -727,73 +728,97 @@ static MP_DEFINE_CONST_OBJ_TYPE(
 // getaddrinfo() implementation
 //
 
-typedef struct _getaddrinfo_state_t {
-    mp_obj_t result;
-    struct k_sem sem;
-    mp_obj_t port;
-    int status;
-} getaddrinfo_state_t;
+static mp_obj_t mod_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_host, ARG_port, ARG_af, ARG_type, ARG_proto, ARG_flags };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_host, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_port, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_af, MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_type, MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_proto, MP_ARG_INT, {.u_int = -1} },
+        { MP_QSTR_flags, MP_ARG_INT, {.u_int = -1} },
+    };
 
-void dns_resolve_cb(enum dns_resolve_status status, struct dns_addrinfo *info, void *user_data) {
-    getaddrinfo_state_t *state = user_data;
-    DEBUG_printf("dns status: %d\n", status);
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
-    if (info == NULL) {
-        if (status == DNS_EAI_ALLDONE) {
-            status = 0;
+    struct zsock_addrinfo hints = { 0 };
+    struct zsock_addrinfo *result = NULL;
+    const char *host = mp_obj_str_get_str(args[ARG_host].u_obj);
+    unsigned int port_int;
+    /* Max port be uint16_t max, this safe */
+    char port[10];
+    int ret;
+
+    if (args[ARG_af].u_int != -1) {
+        hints.ai_family = args[ARG_af].u_int;
+        (void)socket_family_get_str(hints.ai_family);
+    }
+    if (args[ARG_type].u_int != -1) {
+        hints.ai_socktype = args[ARG_type].u_int;
+        /* 0 = Any */
+        if (hints.ai_socktype != 0) {
+            (void)socket_type_get_str(hints.ai_socktype);
         }
-        state->status = status;
-        k_sem_give(&state->sem);
-        return;
+    }
+    if (args[ARG_proto].u_int != -1) {
+        hints.ai_protocol = args[ARG_proto].u_int;
+        (void)socket_proto_get(hints.ai_protocol);
+    }
+    if (args[ARG_flags].u_int != -1) {
+        hints.ai_flags = args[ARG_flags].u_int;
     }
 
-    mp_obj_tuple_t *tuple = mp_obj_new_tuple(5, NULL);
-    tuple->items[0] = MP_OBJ_NEW_SMALL_INT(info->ai_family);
-    // info->ai_socktype not filled
-    tuple->items[1] = MP_OBJ_NEW_SMALL_INT(SOCK_STREAM);
-    // info->ai_protocol not filled
-    tuple->items[2] = MP_OBJ_NEW_SMALL_INT(IPPROTO_TCP);
-    tuple->items[3] = MP_OBJ_NEW_QSTR(MP_QSTR_);
-    tuple->items[4] = format_inet_addr(&info->ai_addr, state->port);
-    mp_obj_list_append(state->result, MP_OBJ_FROM_PTR(tuple));
+    /* Parse int so we can use hex and stuffs if we want */
+    if (mp_obj_is_integer(args[ARG_port].u_obj)) {
+        port_int = mp_obj_get_uint(args[ARG_port].u_obj);
+    } else {
+        size_t len = mp_obj_get_uint(mp_obj_len(args[ARG_port].u_obj));
+        port_int = mp_obj_get_uint(mp_parse_num_integer(args[ARG_port].u_obj, len, 0, NULL));
+    }
+    /* Recompose to string */
+    ret = snprintf(port, sizeof(port), "%u", port_int);
+    if (ret < 0 || ret+1 > sizeof(port)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid port number"));
+    }
+
+    if (host[0] == '\0') {
+        // a host of "" is equivalent to the default/all-local IP address
+        host = "0.0.0.0";
+    }
+
+    hints.ai_flags |= AI_CANONNAME;
+
+    MP_THREAD_GIL_EXIT();
+    ret = zsock_getaddrinfo(host, port, &hints, &result);
+    MP_THREAD_GIL_ENTER();
+
+    if (ret != 0) {
+        mp_raise_OSError(ret > 0 ? -ret : ret);
+    }
+
+    mp_obj_t ret_list = mp_obj_new_list(0, NULL);
+
+    for (struct zsock_addrinfo *resi = result; resi; resi = resi->ai_next) {
+        mp_obj_t tobj[] = {
+            mp_obj_new_int(resi->ai_family),
+            mp_obj_new_int(resi->ai_socktype),
+            mp_obj_new_int(resi->ai_protocol),
+            mp_obj_new_str_from_cstr(resi->ai_canonname),
+            socket_format_addr(resi->ai_addr)
+        };
+        mp_obj_list_append(ret_list, mp_obj_new_tuple(ARRAY_SIZE(tobj), tobj));
+    }
+
+    zsock_freeaddrinfo(result);
+
+    return ret_list;
 }
+static MP_DEFINE_CONST_FUN_OBJ_KW(mod_getaddrinfo_obj, 0, mod_getaddrinfo);
 
-static mp_obj_t mod_getaddrinfo(size_t n_args, const mp_obj_t *args) {
-    mp_obj_t host_in = args[0], port_in = args[1];
-    const char *host = mp_obj_str_get_str(host_in);
-    mp_int_t family = 0;
-    if (n_args > 2) {
-        family = mp_obj_get_int(args[2]);
-    }
+#if defined(CONFIG_NET_BUF_POOL_USAGE)
 
-    getaddrinfo_state_t state;
-    // Just validate that it's int
-    (void)mp_obj_get_int(port_in);
-    state.port = port_in;
-    state.result = mp_obj_new_list(0, NULL);
-    k_sem_init(&state.sem, 0, UINT_MAX);
-
-    for (int i = 2; i--;) {
-        int type = (family != AF_INET6 ? DNS_QUERY_TYPE_A : DNS_QUERY_TYPE_AAAA);
-        RAISE_ERRNO(dns_get_addr_info(host, type, NULL, dns_resolve_cb, &state, 3000));
-        k_sem_take(&state.sem, K_FOREVER);
-        if (family != 0) {
-            break;
-        }
-        family = AF_INET6;
-    }
-
-    // Raise error only if there's nothing to return, otherwise
-    // it may be IPv4 vs IPv6 differences.
-    mp_int_t len = MP_OBJ_SMALL_INT_VALUE(mp_obj_len(state.result));
-    if (state.status != 0 && len == 0) {
-        mp_raise_OSError(state.status);
-    }
-
-    return state.result;
-}
-static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_getaddrinfo_obj, 2, 3, mod_getaddrinfo);
-
+#include <zephyr/net/net_pkt.h>
 
 static mp_obj_t pkt_get_info(void) {
     struct k_mem_slab *rx, *tx;
@@ -807,6 +832,8 @@ static mp_obj_t pkt_get_info(void) {
     return MP_OBJ_FROM_PTR(t);
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(pkt_get_info_obj, pkt_get_info);
+
+#endif
 
 static const mp_rom_map_elem_t mp_module_socket_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_socket) },
@@ -847,7 +874,9 @@ static const mp_rom_map_elem_t mp_module_socket_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_SO_REUSEADDR), MP_ROM_INT(2) },
 
     { MP_ROM_QSTR(MP_QSTR_getaddrinfo), MP_ROM_PTR(&mod_getaddrinfo_obj) },
+    #if defined(CONFIG_NET_BUF_POOL_USAGE)
     { MP_ROM_QSTR(MP_QSTR_pkt_get_info), MP_ROM_PTR(&pkt_get_info_obj) },
+    #endif
 };
 
 static MP_DEFINE_CONST_DICT(mp_module_socket_globals, mp_module_socket_globals_table);
