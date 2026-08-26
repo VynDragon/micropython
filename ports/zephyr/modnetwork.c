@@ -28,6 +28,9 @@
 
 #if MICROPY_PY_ZEPHYR_NETWORK
 
+BUILD_ASSERT(IS_ENABLED(CONFIG_NETWORKING),
+    "CONFIG_NETWORKING must be enabled to use MICROPY_PY_ZEPHYR_NETWORK");
+
 #include <zephyr/net/hostname.h>
 #include <zephyr/net/dns_resolve.h>
 

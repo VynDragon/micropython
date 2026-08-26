@@ -28,6 +28,9 @@
 
 #if MICROPY_PY_ZEPHYR_NETWORK_WLAN
 
+BUILD_ASSERT(IS_ENABLED(CONFIG_NETWORKING) && IS_ENABLED(CONFIG_WIFI),
+    "CONFIG_NETWORKING and CONFIG_WIFI must be enabled to use MICROPY_PY_ZEPHYR_NETWORK_WLAN");
+
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/net/wifi.h>
 #include <zephyr/net/wifi_mgmt.h>

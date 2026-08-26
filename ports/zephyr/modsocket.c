@@ -27,10 +27,15 @@
 
 #include "py/mpconfig.h"
 
-#ifdef MICROPY_PY_SOCKET
+#if MICROPY_PY_SOCKET
+
+BUILD_ASSERT(IS_ENABLED(CONFIG_NET_SOCKETS),
+    "CONFIG_NET_SOCKETS must be enabled to use MICROPY_PY_SOCKET");
 
 #include <zephyr/kernel.h>
+#include <zephyr/net/quic.h>
 #include <zephyr/net/socket.h>
+#include <zephyr/net/socketcan.h>
 #include <zephyr/posix/fcntl.h>
 
 #include "py/objstr.h"
@@ -38,30 +43,16 @@
 #include "py/runtime.h"
 #include "py/stream.h"
 
-typedef enum _socket_obj_state_t {
-    SOCK_STATE_NEW = 0,
-    SOCK_STATE_CONNECTING = 1,
-    SOCK_STATE_CONNECTED = 2,
-    SOCK_STATE_PEER_CLOSED = 3,
-} socket_obj_state_t;
+#include "modsocket.h"
 
-typedef struct _socket_obj_t {
-    mp_obj_base_t base;
-    int ctx;
-    enum net_sock_type type;
-    net_sa_family_t family;
-    int proto;
-    bool bound;
-    int timeout;
-    socket_obj_state_t state;
-} socket_obj_t;
+#define DNS_RETRY_AGAIN 3
 
-static const mp_obj_type_t socket_type;
+const mp_obj_type_t zephyr_socket_type;
 
 // Helper functions
 
 socket_obj_t *socket_new(socket_obj_t *from) {
-    socket_obj_t *socket = mp_obj_malloc_with_finaliser(socket_obj_t, &socket_type);
+    socket_obj_t *socket = mp_obj_malloc_with_finaliser(socket_obj_t, &zephyr_socket_type);
     socket->state = SOCK_STATE_NEW;
     socket->bound = false;
     socket->timeout = -1;
@@ -243,6 +234,25 @@ static int socket_parse_addr(socket_obj_t *socket, mp_obj_t addr_in, struct net_
     return -EINVAL;
 }
 
+static void socket_format_addr_correct_port(const struct net_sockaddr *saddr_in, unsigned int port) {
+    switch (saddr_in->sa_family) {
+    #if defined(CONFIG_NET_IPV4)
+    case NET_AF_INET: {
+        struct net_sockaddr_in *addr_sin = (struct net_sockaddr_in *)saddr_in;
+        addr_sin->sin_port = port;
+        return;
+    }
+    #endif
+    #if defined(CONFIG_NET_IPV6)
+    case NET_AF_INET6: {
+        struct net_sockaddr_in6 *addr_sin = (struct net_sockaddr_in6 *)saddr_in;
+        addr_sin->sin6_port = port;
+    }
+    #endif
+    }
+    return;
+}
+
 static mp_obj_t socket_format_addr(const struct net_sockaddr *saddr_in) {
 
     switch (saddr_in->sa_family) {
@@ -308,7 +318,7 @@ static int socket_read_handler(socket_obj_t *self, void *buf, size_t *len, uint3
         .revents = 0,
     };
 
-    /* If data is waiting, don't lock GIL */
+    /* If data is waiting, don't unlock GIL */
     int ret = zsock_poll(&fds, 1, 0);
     if (ret < 0) {
         return MP_EIO;
@@ -323,7 +333,9 @@ static int socket_read_handler(socket_obj_t *self, void *buf, size_t *len, uint3
     }
 
     if (recv_len < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        if (errno == ENOTCONN) {
+            self->state = SOCK_STATE_PEER_CLOSED;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
             return MP_EWOULDBLOCK;
         }
         return errno;
@@ -417,7 +429,6 @@ static mp_obj_t socket_bind(mp_obj_t self_in, mp_obj_t addr_in) {
     if (ret < 0) {
         mp_raise_OSError(errno);
     }
-    self->state = SOCK_STATE_CONNECTED;
     self->bound = true;
 
     return mp_const_none;
@@ -431,7 +442,9 @@ static mp_obj_t socket_connect(mp_obj_t self_in, mp_obj_t addr_in) {
     struct net_sockaddr saddr_in;
     socket_parse_addr(self, addr_in, &saddr_in);
 
+    MP_THREAD_GIL_EXIT();
     int ret = zsock_connect(self->ctx, &saddr_in, sizeof(saddr_in));
+    MP_THREAD_GIL_ENTER();
     if (ret < 0) {
         if (self->timeout == 0 && errno == EINPROGRESS) {
             self->state = SOCK_STATE_CONNECTING;
@@ -450,6 +463,10 @@ static mp_obj_t socket_listen(size_t n_args, const mp_obj_t *args) {
     socket_obj_t *self = MP_OBJ_TO_PTR(args[0]);
     socket_check_closed(self);
 
+    if (!self->bound) {
+        mp_raise_OSError(MP_EINVAL);
+    }
+
     mp_int_t backlog = MICROPY_PY_SOCKET_LISTEN_BACKLOG_DEFAULT;
     if (n_args > 1) {
         backlog = mp_obj_get_int(args[1]);
@@ -461,6 +478,8 @@ static mp_obj_t socket_listen(size_t n_args, const mp_obj_t *args) {
         mp_raise_OSError(errno);
     }
 
+    self->state = SOCK_STATE_LISTENING;
+
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_listen_obj, 1, 2, socket_listen);
@@ -469,16 +488,19 @@ static mp_obj_t socket_accept(mp_obj_t self_in) {
     socket_obj_t *self = MP_OBJ_TO_PTR(self_in);
     socket_check_closed(self);
 
-    if (!self->bound) {
+    if (self->state != SOCK_STATE_LISTENING) {
         mp_raise_OSError(MP_EINVAL);
     }
 
     struct net_sockaddr saddr_in;
     socklen_t addrlen = sizeof(saddr_in);
     int ctx = zsock_accept(self->ctx, &saddr_in, &addrlen);
+    if (ctx < 0) {
+        mp_raise_OSError(errno);
+    }
 
     socket_obj_t *socket = socket_new(self);
-    socket->state = SOCK_STATE_CONNECTED;
+    socket->state = SOCK_STATE_ACCEPTED;
     socket->ctx = ctx;
 
     mp_obj_tuple_t *client = MP_OBJ_TO_PTR(mp_obj_new_tuple(2, NULL));
@@ -497,6 +519,9 @@ static mp_obj_t socket_send(mp_obj_t self_in, mp_obj_t buf_in) {
     mp_get_buffer_raise(buf_in, &bufinfo, MP_BUFFER_READ);
 
     ssize_t len = zsock_send(self->ctx, bufinfo.buf, bufinfo.len, 0);
+    if (errno == ENOTCONN) {
+        self->state = SOCK_STATE_PEER_CLOSED;
+    }
     if (len < 0) {
         mp_raise_OSError(errno);
     }
@@ -564,11 +589,83 @@ static mp_obj_t socket_recvfrom(size_t n_args, const mp_obj_t *args) {
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_recvfrom_obj, 2, 3, socket_recvfrom);
 
 static mp_obj_t socket_setsockopt(size_t n_args, const mp_obj_t *args) {
-    (void)n_args; // always 4
-    mp_warning(MP_WARN_CAT(RuntimeWarning), "setsockopt() not implemented");
+    socket_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    socket_check_closed(self);
+
+    int level = mp_obj_get_int(args[1]);
+    int opt = mp_obj_get_int(args[2]);
+
+    const void *optval;
+    mp_uint_t optlen;
+    mp_int_t val;
+    if (mp_obj_is_integer(args[3])) {
+        val = mp_obj_get_int_truncated(args[3]);
+        optval = &val;
+        optlen = sizeof(val);
+    } else if (args[3] == mp_const_none) {
+        optval = NULL;
+        optlen = 0;
+    } else if (mp_obj_is_callable(args[3])) {
+        optval = args[3];
+        optlen = sizeof(optval);
+    } else {
+        mp_buffer_info_t bufinfo;
+        mp_get_buffer_raise(args[3], &bufinfo, MP_BUFFER_READ);
+        optval = bufinfo.buf;
+        optlen = bufinfo.len;
+    }
+
+    int ret = zsock_setsockopt(self->ctx, level, opt, optval, optlen);
+    if (ret < 0) {
+        if (errno == EINVAL) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("opt invalid for this level"));
+        } else if (errno == ENOPROTOOPT) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("opt invalid for this protocol"));
+        }
+        mp_raise_OSError(errno);
+    }
+
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_setsockopt_obj, 4, 4, socket_setsockopt);
+
+static mp_obj_t socket_getsockopt(size_t n_args, const mp_obj_t *args) {
+    socket_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+
+    socket_check_closed(self);
+
+    int level = mp_obj_get_int(args[1]);
+    int opt = mp_obj_get_int(args[2]);
+
+    void *optval;
+    net_socklen_t optlen;
+    int val;
+
+    if (n_args == 4) {
+        optlen = mp_obj_get_uint(args[3]);
+        optval = m_new(byte, optlen);
+    } else {
+        optval = &val;
+        optlen = sizeof(val);
+    }
+
+    int ret = zsock_getsockopt(self->ctx, level, opt, optval, &optlen);
+    if (ret < 0) {
+        if (errno == EINVAL) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("opt invalid for this level"));
+        } else if (errno == ENOPROTOOPT) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("opt invalid for this protocol"));
+        }
+        mp_raise_OSError(errno);
+    }
+
+    if (n_args == 4) {
+        return mp_obj_new_bytearray_by_ref(optlen, optval);
+    }
+    return mp_obj_new_int(val);
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(socket_getsockopt_obj, 3, 4, socket_getsockopt);
 
 static mp_obj_t socket_setblocking(const mp_obj_t arg0, const mp_obj_t arg1) {
     socket_obj_t *self = MP_OBJ_TO_PTR(arg0);
@@ -607,6 +704,7 @@ static const mp_rom_map_elem_t socket_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_recv), MP_ROM_PTR(&socket_recv_obj) },
     { MP_ROM_QSTR(MP_QSTR_recvfrom), MP_ROM_PTR(&socket_recvfrom_obj) },
     { MP_ROM_QSTR(MP_QSTR_setsockopt), MP_ROM_PTR(&socket_setsockopt_obj) },
+    { MP_ROM_QSTR(MP_QSTR_getsockopt), MP_ROM_PTR(&socket_getsockopt_obj) },
     { MP_ROM_QSTR(MP_QSTR_setblocking), MP_ROM_PTR(&socket_setblocking_obj) },
 
     { MP_ROM_QSTR(MP_QSTR_read), MP_ROM_PTR(&mp_stream_read_obj) },
@@ -714,8 +812,8 @@ static const mp_stream_p_t socket_stream_p = {
     .ioctl = sock_ioctl,
 };
 
-static MP_DEFINE_CONST_OBJ_TYPE(
-    socket_type,
+MP_DEFINE_CONST_OBJ_TYPE(
+    zephyr_socket_type,
     MP_QSTR_socket,
     MP_TYPE_FLAG_NONE,
     make_new, socket_make_new,
@@ -728,7 +826,7 @@ static MP_DEFINE_CONST_OBJ_TYPE(
 // getaddrinfo() implementation
 //
 
-static mp_obj_t mod_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+static mp_obj_t mod_socket_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_host, ARG_port, ARG_af, ARG_type, ARG_proto, ARG_flags };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_host, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
@@ -773,8 +871,9 @@ static mp_obj_t mod_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, mp_map_
     if (mp_obj_is_integer(args[ARG_port].u_obj)) {
         port_int = mp_obj_get_uint(args[ARG_port].u_obj);
     } else {
-        size_t len = mp_obj_get_uint(mp_obj_len(args[ARG_port].u_obj));
-        port_int = mp_obj_get_uint(mp_parse_num_integer(args[ARG_port].u_obj, len, 0, NULL));
+        size_t len;
+        const char *buf = mp_obj_str_get_data(args[ARG_port].u_obj, &len);
+        port_int = mp_obj_get_uint(mp_parse_num_integer(buf, len, 0, NULL));
     }
     /* Recompose to string */
     ret = snprintf(port, sizeof(port), "%u", port_int);
@@ -790,7 +889,11 @@ static mp_obj_t mod_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, mp_map_
     hints.ai_flags |= AI_CANONNAME;
 
     MP_THREAD_GIL_EXIT();
-    ret = zsock_getaddrinfo(host, port, &hints, &result);
+    int tries = DNS_RETRY_AGAIN;
+    do {
+        ret = zsock_getaddrinfo(host, port, &hints, &result);
+        tries--;
+    } while ((ret == DNS_EAI_AGAIN || ret == DNS_EAI_CANCELED) && tries > 0);
     MP_THREAD_GIL_ENTER();
 
     if (ret != 0) {
@@ -799,13 +902,16 @@ static mp_obj_t mod_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, mp_map_
 
     mp_obj_t ret_list = mp_obj_new_list(0, NULL);
 
+
     for (struct zsock_addrinfo *resi = result; resi; resi = resi->ai_next) {
+        /* Replace port with port provided as input */
+        socket_format_addr_correct_port(resi->ai_addr, port_int);
         mp_obj_t tobj[] = {
             mp_obj_new_int(resi->ai_family),
             mp_obj_new_int(resi->ai_socktype),
             mp_obj_new_int(resi->ai_protocol),
             mp_obj_new_str_from_cstr(resi->ai_canonname),
-            socket_format_addr(resi->ai_addr)
+            socket_format_addr(resi->ai_addr),
         };
         mp_obj_list_append(ret_list, mp_obj_new_tuple(ARRAY_SIZE(tobj), tobj));
     }
@@ -814,13 +920,13 @@ static mp_obj_t mod_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, mp_map_
 
     return ret_list;
 }
-static MP_DEFINE_CONST_FUN_OBJ_KW(mod_getaddrinfo_obj, 0, mod_getaddrinfo);
+static MP_DEFINE_CONST_FUN_OBJ_KW(mod_socket_getaddrinfo_obj, 0, mod_socket_getaddrinfo);
 
 #if defined(CONFIG_NET_BUF_POOL_USAGE)
 
 #include <zephyr/net/net_pkt.h>
 
-static mp_obj_t pkt_get_info(void) {
+static mp_obj_t mod_socket_pkt_get_info(void) {
     struct k_mem_slab *rx, *tx;
     struct net_buf_pool *rx_data, *tx_data;
     net_pkt_get_info(&rx, &tx, &rx_data, &tx_data);
@@ -831,27 +937,343 @@ static mp_obj_t pkt_get_info(void) {
     t->items[3] = MP_OBJ_NEW_SMALL_INT(tx_data->avail_count);
     return MP_OBJ_FROM_PTR(t);
 }
-static MP_DEFINE_CONST_FUN_OBJ_0(pkt_get_info_obj, pkt_get_info);
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_socket_pkt_get_info_obj, mod_socket_pkt_get_info);
 
 #endif
 
+/* Self-document features */
+
+static const mp_rom_obj_tuple_t mod_socket_af_available_obj = {
+    .base = {&mp_type_tuple},
+    /* lol */
+    .len = 1 IF_ENABLED(CONFIG_NET_IPV4, (+1)) IF_ENABLED(CONFIG_NET_IPV6, (+1))
+        IF_ENABLED(CONFIG_NET_SOCKETS_PACKET, (+1)) IF_ENABLED(CONFIG_NET_SOCKETS_CAN, (+1))
+        IF_ENABLED(CONFIG_NET_SOCKETS_NET_MGMT, (+1)),
+    .items = {
+        MP_ROM_INT(NET_AF_LOCAL),
+        #if defined(CONFIG_NET_IPV4)
+        MP_ROM_INT(NET_AF_INET),
+        #endif
+        #if defined(CONFIG_NET_IPV6)
+        MP_ROM_INT(NET_AF_INET6),
+        #endif
+        #if defined(CONFIG_NET_SOCKETS_PACKET)
+        MP_ROM_INT(NET_AF_PACKET),
+        #endif
+        #if defined(CONFIG_NET_SOCKETS_CAN)
+        MP_ROM_INT(NET_AF_CAN),
+        #endif
+        #if defined(CONFIG_NET_SOCKETS_NET_MGMT)
+        MP_ROM_INT(NET_AF_NET_MGMT),
+        #endif
+    },
+};
+
+static const mp_rom_obj_tuple_t mod_socket_proto_available_obj = {
+    .base = {&mp_type_tuple},
+    .len = 1 IF_ENABLED(CONFIG_NET_TCP, (+1)) IF_ENABLED(CONFIG_NET_UDP, (+1))
+        IF_ENABLED(CONFIG_NET_IPV4, (+2)) IF_ENABLED(CONFIG_NET_IPV6, (+2))
+        IF_ENABLED(CONFIG_NET_IPV4_IGMP, (+1)) IF_ENABLED(CONFIG_NET_L2_IPIP, (+1))
+        IF_ENABLED(CONFIG_NET_SOCKETS_PACKET, (+1)) IF_ENABLED(CONFIG_NET_SOCKETS_SOCKOPT_TLS, (+4))
+        IF_ENABLED(CONFIG_NET_SOCKETS_ENABLE_DTLS, (+2)) IF_ENABLED(CONFIG_QUIC, (+1)),
+    .items = {
+        MP_ROM_INT(NET_IPPROTO_RAW),
+        #if defined(CONFIG_NET_TCP)
+        MP_ROM_INT(NET_IPPROTO_TCP),
+        #endif
+        #if defined(CONFIG_NET_UDP)
+        MP_ROM_INT(NET_IPPROTO_UDP),
+        #endif
+        #if defined(CONFIG_NET_IPV4)
+        MP_ROM_INT(NET_IPPROTO_IP),
+        MP_ROM_INT(NET_IPPROTO_ICMP),
+        #endif
+        #if defined(CONFIG_NET_IPV6)
+        MP_ROM_INT(NET_IPPROTO_IPV6),
+        MP_ROM_INT(NET_IPPROTO_ICMPV6),
+        #endif
+        #if defined(CONFIG_NET_IPV4_IGMP)
+        MP_ROM_INT(NET_IPPROTO_IGMP),
+        #endif
+        #if defined(CONFIG_NET_L2_IPIP)
+        MP_ROM_INT(NET_IPPROTO_IPIP),
+        #endif
+        #if defined(CONFIG_NET_SOCKETS_PACKET)
+        MP_ROM_INT(NET_IPPROTO_ETH_P_ALL),
+        #endif
+        #if defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
+        MP_ROM_INT(NET_IPPROTO_TLS_1_0),
+        MP_ROM_INT(NET_IPPROTO_TLS_1_1),
+        MP_ROM_INT(NET_IPPROTO_TLS_1_2),
+        MP_ROM_INT(NET_IPPROTO_TLS_1_3),
+        #endif
+        #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
+        MP_ROM_INT(NET_IPPROTO_DTLS_1_0),
+        MP_ROM_INT(NET_IPPROTO_DTLS_1_2),
+        #endif
+        #if defined(CONFIG_QUIC)
+        MP_ROM_INT(NET_IPPROTO_QUIC),
+        #endif
+    },
+};
+
+static mp_obj_t mod_socket_print_available(void) {
+    mp_obj_t tobj[2];
+    mp_obj_t tobj_af[mod_socket_af_available_obj.len];
+    mp_obj_t tobj_proto[mod_socket_proto_available_obj.len];
+
+    for (size_t i = 0; i < mod_socket_af_available_obj.len; i++) {
+        tobj_af[i] = mp_obj_new_str_from_cstr(
+            socket_family_get_str(mp_obj_get_int(mod_socket_af_available_obj.items[i])));
+    }
+
+    for (size_t i = 0; i < mod_socket_proto_available_obj.len; i++) {
+        tobj_proto[i] = mp_obj_new_str_from_cstr(
+            socket_proto_get(mp_obj_get_int(mod_socket_proto_available_obj.items[i])).str);
+    }
+
+    tobj[0] = mp_obj_new_tuple(ARRAY_SIZE(tobj_af), tobj_af);
+    tobj[1] = mp_obj_new_tuple(ARRAY_SIZE(tobj_proto), tobj_proto);
+
+    return mp_obj_new_tuple(ARRAY_SIZE(tobj), tobj);
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_socket_print_available_obj, mod_socket_print_available);
+
+/* Sockopts for SOCKET level */
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_SOCKET_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_DEBUG), MP_ROM_INT(ZSOCK_SO_DEBUG) },
+    { MP_ROM_QSTR(MP_QSTR_REUSEADDR), MP_ROM_INT(ZSOCK_SO_REUSEADDR) },
+    { MP_ROM_QSTR(MP_QSTR_TYPE), MP_ROM_INT(ZSOCK_SO_TYPE) },
+    { MP_ROM_QSTR(MP_QSTR_ERROR), MP_ROM_INT(ZSOCK_SO_ERROR) },
+    { MP_ROM_QSTR(MP_QSTR_DONTROUTE), MP_ROM_INT(ZSOCK_SO_DONTROUTE) },
+    { MP_ROM_QSTR(MP_QSTR_BROADCAST), MP_ROM_INT(ZSOCK_SO_BROADCAST) },
+    { MP_ROM_QSTR(MP_QSTR_SNDBUF), MP_ROM_INT(ZSOCK_SO_SNDBUF) },
+    { MP_ROM_QSTR(MP_QSTR_RCVBUF), MP_ROM_INT(ZSOCK_SO_RCVBUF) },
+    { MP_ROM_QSTR(MP_QSTR_KEEPALIVE), MP_ROM_INT(ZSOCK_SO_KEEPALIVE) },
+    { MP_ROM_QSTR(MP_QSTR_OOBINLINE), MP_ROM_INT(ZSOCK_SO_OOBINLINE) },
+    { MP_ROM_QSTR(MP_QSTR_PRIORITY), MP_ROM_INT(ZSOCK_SO_PRIORITY) },
+    { MP_ROM_QSTR(MP_QSTR_LINGER), MP_ROM_INT(ZSOCK_SO_LINGER) },
+    { MP_ROM_QSTR(MP_QSTR_REUSEPORT), MP_ROM_INT(ZSOCK_SO_REUSEPORT) },
+    { MP_ROM_QSTR(MP_QSTR_RCVLOWAT), MP_ROM_INT(ZSOCK_SO_RCVLOWAT) },
+    { MP_ROM_QSTR(MP_QSTR_SNDLOWAT), MP_ROM_INT(ZSOCK_SO_SNDLOWAT) },
+    { MP_ROM_QSTR(MP_QSTR_RCVTIMEO), MP_ROM_INT(ZSOCK_SO_RCVTIMEO) },
+    { MP_ROM_QSTR(MP_QSTR_SNDTIMEO), MP_ROM_INT(ZSOCK_SO_SNDTIMEO) },
+    { MP_ROM_QSTR(MP_QSTR_BINDTODEVICE), MP_ROM_INT(ZSOCK_SO_BINDTODEVICE) },
+    { MP_ROM_QSTR(MP_QSTR_ACCEPTCONN), MP_ROM_INT(ZSOCK_SO_ACCEPTCONN) },
+    { MP_ROM_QSTR(MP_QSTR_TIMESTAMPING), MP_ROM_INT(ZSOCK_SO_TIMESTAMPING) },
+    { MP_ROM_QSTR(MP_QSTR_PROTOCOL), MP_ROM_INT(ZSOCK_SO_PROTOCOL) },
+    { MP_ROM_QSTR(MP_QSTR_DOMAIN), MP_ROM_INT(ZSOCK_SO_DOMAIN) },
+    { MP_ROM_QSTR(MP_QSTR_SOCKS5), MP_ROM_INT(ZSOCK_SO_SOCKS5) },
+    { MP_ROM_QSTR(MP_QSTR_TXTIME), MP_ROM_INT(ZSOCK_SO_TXTIME) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_SOCKET, mp_module_socket_globals_SOL_SOCKET_table);
+
+/* Sockopts for TCP level */
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_TCP_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_NODELAY), MP_ROM_INT(ZSOCK_TCP_NODELAY) },
+    { MP_ROM_QSTR(MP_QSTR_KEEPIDLE), MP_ROM_INT(ZSOCK_TCP_KEEPIDLE) },
+    { MP_ROM_QSTR(MP_QSTR_KEEPINTVL), MP_ROM_INT(ZSOCK_TCP_KEEPINTVL) },
+    { MP_ROM_QSTR(MP_QSTR_KEEPCNT), MP_ROM_INT(ZSOCK_TCP_KEEPCNT) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_TCP, mp_module_socket_globals_SOL_TCP_table);
+
+/* Sockopts for UDP level */
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_UDP_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_OPT), MP_ROM_INT(ZSOCK_UDP_OPT) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_OCS), MP_ROM_INT(ZSOCK_UDP_OPT_OCS) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_APC), MP_ROM_INT(ZSOCK_UDP_OPT_APC) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_FRAG), MP_ROM_INT(ZSOCK_UDP_OPT_FRAG) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_MDS), MP_ROM_INT(ZSOCK_UDP_OPT_MDS) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_MRDS), MP_ROM_INT(ZSOCK_UDP_OPT_MRDS) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_REQ), MP_ROM_INT(ZSOCK_UDP_OPT_REQ) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_RES), MP_ROM_INT(ZSOCK_UDP_OPT_RES) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_TIME), MP_ROM_INT(ZSOCK_UDP_OPT_TIME) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_AUTH), MP_ROM_INT(ZSOCK_UDP_OPT_AUTH) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_EXP), MP_ROM_INT(ZSOCK_UDP_OPT_EXP) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_UCMP), MP_ROM_INT(ZSOCK_UDP_OPT_UCMP) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_UENC), MP_ROM_INT(ZSOCK_UDP_OPT_UENC) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_UEXP), MP_ROM_INT(ZSOCK_UDP_OPT_UEXP) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_DPLPMTUD), MP_ROM_INT(ZSOCK_UDP_OPT_DPLPMTUD) },
+    { MP_ROM_QSTR(MP_QSTR_OPT_DPLPMTUD_APP_RESPOND), MP_ROM_INT(ZSOCK_UDP_OPT_DPLPMTUD_APP_RESPOND) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_UDP, mp_module_socket_globals_SOL_UDP_table);
+
+/* Sockopts for IP level */
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_IP_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_TOS), MP_ROM_INT(ZSOCK_IP_TOS) },
+    { MP_ROM_QSTR(MP_QSTR_TTL), MP_ROM_INT(ZSOCK_IP_TTL) },
+    { MP_ROM_QSTR(MP_QSTR_PKTINFO), MP_ROM_INT(ZSOCK_IP_PKTINFO) },
+    { MP_ROM_QSTR(MP_QSTR_RECVTTL), MP_ROM_INT(ZSOCK_IP_RECVTTL) },
+    { MP_ROM_QSTR(MP_QSTR_MTU), MP_ROM_INT(ZSOCK_IP_MTU) },
+    { MP_ROM_QSTR(MP_QSTR_DONTFRAG), MP_ROM_INT(ZSOCK_IP_DONTFRAG) },
+    { MP_ROM_QSTR(MP_QSTR_MULTICAST_IF), MP_ROM_INT(ZSOCK_IP_MULTICAST_IF) },
+    { MP_ROM_QSTR(MP_QSTR_MULTICAST_TTL), MP_ROM_INT(ZSOCK_IP_MULTICAST_TTL) },
+    { MP_ROM_QSTR(MP_QSTR_MULTICAST_LOOP), MP_ROM_INT(ZSOCK_IP_MULTICAST_LOOP) },
+    { MP_ROM_QSTR(MP_QSTR_ADD_MEMBERSHIP), MP_ROM_INT(ZSOCK_IP_ADD_MEMBERSHIP) },
+    { MP_ROM_QSTR(MP_QSTR_DROP_MEMBERSHIP), MP_ROM_INT(ZSOCK_IP_DROP_MEMBERSHIP) },
+    { MP_ROM_QSTR(MP_QSTR_LOCAL_PORT_RANGE), MP_ROM_INT(ZSOCK_IP_LOCAL_PORT_RANGE) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_IP, mp_module_socket_globals_SOL_IP_table);
+
+/* Sockopts for IPV6 level */
+
+static const mp_rom_map_elem_t mp_module_socket_globals_SO_IPV6_ADDR_PREFERENCES_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_MSK_PREFER_SRC_TMP), MP_ROM_INT(ZSOCK_IPV6_PREFER_SRC_TMP) },
+    { MP_ROM_QSTR(MP_QSTR_MSK_PREFER_SRC_PUBLIC), MP_ROM_INT(ZSOCK_IPV6_PREFER_SRC_PUBLIC) },
+    { MP_ROM_QSTR(MP_QSTR_MSK_PREFER_SRC_PUBTMP_DEFAULT), MP_ROM_INT(ZSOCK_IPV6_PREFER_SRC_PUBTMP_DEFAULT) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SO_IPV6_ADDR_PREFERENCES, mp_module_socket_globals_SO_IPV6_ADDR_PREFERENCES_table);
+
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_IPV6_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_UNICAST_HOPS), MP_ROM_INT(ZSOCK_IPV6_UNICAST_HOPS) },
+    { MP_ROM_QSTR(MP_QSTR_MULTICAST_IF), MP_ROM_INT(ZSOCK_IPV6_MULTICAST_IF) },
+    { MP_ROM_QSTR(MP_QSTR_MULTICAST_HOPS), MP_ROM_INT(ZSOCK_IPV6_MULTICAST_HOPS) },
+    { MP_ROM_QSTR(MP_QSTR_MULTICAST_LOOP), MP_ROM_INT(ZSOCK_IPV6_MULTICAST_LOOP) },
+    { MP_ROM_QSTR(MP_QSTR_ADD_MEMBERSHIP), MP_ROM_INT(ZSOCK_IPV6_ADD_MEMBERSHIP) },
+    { MP_ROM_QSTR(MP_QSTR_DROP_MEMBERSHIP), MP_ROM_INT(ZSOCK_IPV6_DROP_MEMBERSHIP) },
+    { MP_ROM_QSTR(MP_QSTR_JOIN_GROUP), MP_ROM_INT(ZSOCK_IPV6_JOIN_GROUP) },
+    { MP_ROM_QSTR(MP_QSTR_LEAVE_GROUP), MP_ROM_INT(ZSOCK_IPV6_LEAVE_GROUP) },
+    { MP_ROM_QSTR(MP_QSTR_MTU), MP_ROM_INT(ZSOCK_IPV6_MTU) },
+    { MP_ROM_QSTR(MP_QSTR_DONTFRAG), MP_ROM_INT(ZSOCK_IPV6_DONTFRAG) },
+    { MP_ROM_QSTR(MP_QSTR_V6ONLY), MP_ROM_INT(ZSOCK_IPV6_V6ONLY) },
+    { MP_ROM_QSTR(MP_QSTR_RECVPKTINFO), MP_ROM_INT(ZSOCK_IPV6_RECVPKTINFO) },
+    { MP_ROM_QSTR(MP_QSTR_PKTINFO), MP_ROM_INT(ZSOCK_IPV6_PKTINFO) },
+    { MP_ROM_QSTR(MP_QSTR_RECVHOPLIMIT), MP_ROM_INT(ZSOCK_IPV6_RECVHOPLIMIT) },
+    { MP_ROM_QSTR(MP_QSTR_HOPLIMIT), MP_ROM_INT(ZSOCK_IPV6_HOPLIMIT) },
+    { MP_ROM_QSTR(MP_QSTR_ADDR_PREFERENCES), MP_ROM_INT(ZSOCK_IPV6_ADDR_PREFERENCES) },
+    { MP_ROM_QSTR(MP_QSTR_IPV6_TCLASS), MP_ROM_INT(ZSOCK_IPV6_TCLASS) },
+
+    { MP_ROM_QSTR(MP_QSTR_ADDR_PREFERENCES_VALUES), MP_ROM_PTR(&mp_module_socket_globals_SO_IPV6_ADDR_PREFERENCES) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_IPV6, mp_module_socket_globals_SOL_IPV6_table);
+
+/* Sockopts for PACKET level */
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_PACKET_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_ADD_MEMBERSHIP), MP_ROM_INT(ZSOCK_PACKET_ADD_MEMBERSHIP) },
+    { MP_ROM_QSTR(MP_QSTR_DROP_MEMBERSHIP), MP_ROM_INT(ZSOCK_PACKET_DROP_MEMBERSHIP) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_PACKET, mp_module_socket_globals_SOL_PACKET_table);
+
+/* Sockopts for TLS level */
+
+static const mp_rom_map_elem_t mp_module_socket_globals_SO_TLS_MAX_FRAGMENT_LENGTH_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_DEFAULT), MP_ROM_INT(ZSOCK_TLS_MFL_DEFAULT) },
+    { MP_ROM_QSTR(MP_QSTR_DISABLED), MP_ROM_INT(ZSOCK_TLS_MFL_DISABLED) },
+    { MP_ROM_QSTR(MP_QSTR_512), MP_ROM_INT(ZSOCK_TLS_MFL_512) },
+    { MP_ROM_QSTR(MP_QSTR_1024), MP_ROM_INT(ZSOCK_TLS_MFL_1024) },
+    { MP_ROM_QSTR(MP_QSTR_2048), MP_ROM_INT(ZSOCK_TLS_MFL_2048) },
+    { MP_ROM_QSTR(MP_QSTR_4096), MP_ROM_INT(ZSOCK_TLS_MFL_4096) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SO_TLS_MAX_FRAGMENT_LENGTH, mp_module_socket_globals_SO_TLS_MAX_FRAGMENT_LENGTH_table);
+
+static const mp_rom_map_elem_t mp_module_socket_globals_SO_TLS_PEER_VERIFY_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_NONE), MP_ROM_INT(ZSOCK_TLS_PEER_VERIFY_NONE) },
+    { MP_ROM_QSTR(MP_QSTR_OPTIONAL), MP_ROM_INT(ZSOCK_TLS_PEER_VERIFY_OPTIONAL) },
+    { MP_ROM_QSTR(MP_QSTR_REQUIRED), MP_ROM_INT(ZSOCK_TLS_PEER_VERIFY_REQUIRED) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SO_TLS_PEER_VERIFY, mp_module_socket_globals_SO_TLS_PEER_VERIFY_table);
+
+static const mp_rom_map_elem_t mp_module_socket_globals_SO_TLS_DTLS_CID_STATUS_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_DISABLED), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_STATUS_DISABLED) },
+    { MP_ROM_QSTR(MP_QSTR_DOWNLINK), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_STATUS_DOWNLINK) },
+    { MP_ROM_QSTR(MP_QSTR_UPLINK), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_STATUS_UPLINK) },
+    { MP_ROM_QSTR(MP_QSTR_BIDIRECTIONAL), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_STATUS_BIDIRECTIONAL) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SO_TLS_DTLS_CID_STATUS, mp_module_socket_globals_SO_TLS_DTLS_CID_STATUS_table);
+
+static const mp_rom_map_elem_t mp_module_socket_globals_SO_TLS_DTLS_CID_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_DISABLED), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_DISABLED) },
+    { MP_ROM_QSTR(MP_QSTR_SUPPORTED), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_SUPPORTED) },
+    { MP_ROM_QSTR(MP_QSTR_ENABLED), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_ENABLED) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SO_TLS_DTLS_CID, mp_module_socket_globals_SO_TLS_DTLS_CID_table);
+
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_TLS_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_SEC_TAG_LIST), MP_ROM_INT(ZSOCK_TLS_SEC_TAG_LIST) },
+    { MP_ROM_QSTR(MP_QSTR_HOSTNAME), MP_ROM_INT(ZSOCK_TLS_HOSTNAME) },
+    { MP_ROM_QSTR(MP_QSTR_CIPHERSUITE_LIST), MP_ROM_INT(ZSOCK_TLS_CIPHERSUITE_LIST) },
+    { MP_ROM_QSTR(MP_QSTR_CIPHERSUITE_USED), MP_ROM_INT(ZSOCK_TLS_CIPHERSUITE_USED) },
+    { MP_ROM_QSTR(MP_QSTR_PEER_VERIFY), MP_ROM_INT(ZSOCK_TLS_PEER_VERIFY) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_ROLE), MP_ROM_INT(ZSOCK_TLS_DTLS_ROLE) },
+    { MP_ROM_QSTR(MP_QSTR_ALPN_LIST), MP_ROM_INT(ZSOCK_TLS_ALPN_LIST) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_HANDSHAKE_TIMEOUT_MIN), MP_ROM_INT(ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MIN) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_HANDSHAKE_TIMEOUT_MAX), MP_ROM_INT(ZSOCK_TLS_DTLS_HANDSHAKE_TIMEOUT_MAX) },
+    { MP_ROM_QSTR(MP_QSTR_CERT_NOCOPY), MP_ROM_INT(ZSOCK_TLS_CERT_NOCOPY) },
+    { MP_ROM_QSTR(MP_QSTR_NATIVE), MP_ROM_INT(ZSOCK_TLS_NATIVE) },
+    { MP_ROM_QSTR(MP_QSTR_SESSION_CACHE), MP_ROM_INT(ZSOCK_TLS_SESSION_CACHE) },
+    { MP_ROM_QSTR(MP_QSTR_SESSION_CACHE_PURGE), MP_ROM_INT(ZSOCK_TLS_SESSION_CACHE_PURGE) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_CID), MP_ROM_INT(ZSOCK_TLS_DTLS_CID) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_CID_STATUS), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_STATUS) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_CID_VALUE), MP_ROM_INT(ZSOCK_TLS_DTLS_CID_VALUE) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_PEER_CID_VALUE), MP_ROM_INT(ZSOCK_TLS_DTLS_PEER_CID_VALUE) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_HANDSHAKE_ON_CONNECT), MP_ROM_INT(ZSOCK_TLS_DTLS_HANDSHAKE_ON_CONNECT) },
+    { MP_ROM_QSTR(MP_QSTR_CERT_VERIFY_RESULT), MP_ROM_INT(ZSOCK_TLS_CERT_VERIFY_RESULT) },
+    { MP_ROM_QSTR(MP_QSTR_CERT_VERIFY_CALLBACK), MP_ROM_INT(ZSOCK_TLS_CERT_VERIFY_CALLBACK) },
+    { MP_ROM_QSTR(MP_QSTR_MAX_FRAGMENT_LENGTH), MP_ROM_INT(ZSOCK_TLS_MAX_FRAGMENT_LENGTH) },
+
+    { MP_ROM_QSTR(MP_QSTR_MAX_FRAGMENT_LENGTH_VALUES), MP_ROM_PTR(&mp_module_socket_globals_SO_TLS_MAX_FRAGMENT_LENGTH) },
+    { MP_ROM_QSTR(MP_QSTR_PEER_VERIFY_VALUES), MP_ROM_PTR(&mp_module_socket_globals_SO_TLS_PEER_VERIFY) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_CID_STATUS_VALUES), MP_ROM_PTR(&mp_module_socket_globals_SO_TLS_DTLS_CID_STATUS) },
+    { MP_ROM_QSTR(MP_QSTR_DTLS_CID_VALUES), MP_ROM_PTR(&mp_module_socket_globals_SO_TLS_DTLS_CID) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_TLS, mp_module_socket_globals_SOL_TLS_table);
+
+/* Sockopts for QUIC level */
+static const mp_rom_map_elem_t mp_module_socket_globals_SOL_QUIC_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_STREAM_TYPE), MP_ROM_INT(ZSOCK_QUIC_SO_STREAM_TYPE) },
+    { MP_ROM_QSTR(MP_QSTR_CERT_CHAIN_ADD), MP_ROM_INT(ZSOCK_QUIC_SO_CERT_CHAIN_ADD) },
+    { MP_ROM_QSTR(MP_QSTR_CERT_CHAIN_DEL), MP_ROM_INT(ZSOCK_QUIC_SO_CERT_CHAIN_DEL) },
+    { MP_ROM_QSTR(MP_QSTR_STOP_SENDING_CODE), MP_ROM_INT(ZSOCK_QUIC_SO_STOP_SENDING_CODE) },
+    { MP_ROM_QSTR(MP_QSTR_SESSION_STATE), MP_ROM_INT(ZSOCK_QUIC_SO_SESSION_STATE) },
+    { MP_ROM_QSTR(MP_QSTR_SESSION_TICKET_ENABLE), MP_ROM_INT(ZSOCK_QUIC_SO_SESSION_TICKET_ENABLE) },
+    { MP_ROM_QSTR(MP_QSTR_MAX_EARLY_DATA_SIZE), MP_ROM_INT(ZSOCK_QUIC_SO_MAX_EARLY_DATA_SIZE) },
+    { MP_ROM_QSTR(MP_QSTR_STREAM_EARLY_DATA), MP_ROM_INT(ZSOCK_QUIC_SO_STREAM_EARLY_DATA) },
+};
+
+static MP_DEFINE_CONST_DICT(mp_module_socket_globals_SOL_QUIC, mp_module_socket_globals_SOL_QUIC_table);
+
 static const mp_rom_map_elem_t mp_module_socket_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_socket) },
-    // objects
-    { MP_ROM_QSTR(MP_QSTR_socket), MP_ROM_PTR(&socket_type) },
-    // class constants
+    /* Objects */
+    { MP_ROM_QSTR(MP_QSTR_socket), MP_ROM_PTR(&zephyr_socket_type) },
+
+    /* Module functions */
+    { MP_ROM_QSTR(MP_QSTR_getaddrinfo), MP_ROM_PTR(&mod_socket_getaddrinfo_obj) },
+    #if defined(CONFIG_NET_BUF_POOL_USAGE)
+    { MP_ROM_QSTR(MP_QSTR_pkt_get_info), MP_ROM_PTR(&mod_socket_pkt_get_info_obj) },
+    #endif
+    { MP_ROM_QSTR(MP_QSTR_print_available), MP_ROM_PTR(&mod_socket_print_available_obj) },
+
+    /* Constants */
+    { MP_ROM_QSTR(MP_QSTR_af_available), MP_ROM_PTR(&mod_socket_af_available_obj) },
+    { MP_ROM_QSTR(MP_QSTR_proto_available), MP_ROM_PTR(&mod_socket_proto_available_obj) },
+    /* Address families */
     { MP_ROM_QSTR(MP_QSTR_AF_UNSPEC), MP_ROM_INT(NET_AF_UNSPEC) },
+    { MP_ROM_QSTR(MP_QSTR_AF_LOCAL), MP_ROM_INT(NET_AF_LOCAL) },
     { MP_ROM_QSTR(MP_QSTR_AF_INET), MP_ROM_INT(NET_AF_INET) },
     { MP_ROM_QSTR(MP_QSTR_AF_INET6), MP_ROM_INT(NET_AF_INET6) },
     { MP_ROM_QSTR(MP_QSTR_AF_PACKET), MP_ROM_INT(NET_AF_PACKET) },
     { MP_ROM_QSTR(MP_QSTR_AF_CAN), MP_ROM_INT(NET_AF_CAN) },
     { MP_ROM_QSTR(MP_QSTR_AF_NET_MGMT), MP_ROM_INT(NET_AF_NET_MGMT) },
-    { MP_ROM_QSTR(MP_QSTR_AF_LOCAL), MP_ROM_INT(NET_AF_LOCAL) },
 
+    /* Socket types */
     { MP_ROM_QSTR(MP_QSTR_SOCK_STREAM), MP_ROM_INT(NET_SOCK_STREAM) },
     { MP_ROM_QSTR(MP_QSTR_SOCK_DGRAM), MP_ROM_INT(NET_SOCK_DGRAM) },
     { MP_ROM_QSTR(MP_QSTR_SOCK_RAW), MP_ROM_INT(NET_SOCK_RAW) },
 
+    /* Socket protocols */
     { MP_ROM_QSTR(MP_QSTR_IPPROTO_IP), MP_ROM_INT(NET_IPPROTO_IP) },
     { MP_ROM_QSTR(MP_QSTR_IPPROTO_ICMP), MP_ROM_INT(NET_IPPROTO_ICMP) },
     { MP_ROM_QSTR(MP_QSTR_IPPROTO_IGMP), MP_ROM_INT(NET_IPPROTO_IGMP) },
@@ -870,13 +1292,34 @@ static const mp_rom_map_elem_t mp_module_socket_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_IPPROTO_DTLS_1_2), MP_ROM_INT(NET_IPPROTO_DTLS_1_2) },
     { MP_ROM_QSTR(MP_QSTR_IPPROTO_QUIC), MP_ROM_INT(NET_IPPROTO_QUIC) },
 
-    { MP_ROM_QSTR(MP_QSTR_SOL_SOCKET), MP_ROM_INT(1) },
-    { MP_ROM_QSTR(MP_QSTR_SO_REUSEADDR), MP_ROM_INT(2) },
+    /* Sock Options */
+    /* Sockopt level */
+    { MP_ROM_QSTR(MP_QSTR_SOL_SOCKET), MP_ROM_INT(ZSOCK_SOL_SOCKET) },
+    { MP_ROM_QSTR(MP_QSTR_SOL_TCP), MP_ROM_INT(NET_IPPROTO_TCP) },
+    { MP_ROM_QSTR(MP_QSTR_SOL_UDP), MP_ROM_INT(NET_IPPROTO_UDP) },
+    { MP_ROM_QSTR(MP_QSTR_SOL_IP), MP_ROM_INT(NET_IPPROTO_IP) },
+    { MP_ROM_QSTR(MP_QSTR_SOL_IPV6), MP_ROM_INT(NET_IPPROTO_IPV6) },
+    { MP_ROM_QSTR(MP_QSTR_SOL_PACKET), MP_ROM_INT(ZSOCK_SOL_PACKET) },
+    { MP_ROM_QSTR(MP_QSTR_SOL_TLS), MP_ROM_INT(ZSOCK_SOL_TLS) },
+    { MP_ROM_QSTR(MP_QSTR_SOL_QUIC), MP_ROM_INT(ZSOCK_SOL_QUIC) },
 
-    { MP_ROM_QSTR(MP_QSTR_getaddrinfo), MP_ROM_PTR(&mod_getaddrinfo_obj) },
-    #if defined(CONFIG_NET_BUF_POOL_USAGE)
-    { MP_ROM_QSTR(MP_QSTR_pkt_get_info), MP_ROM_PTR(&pkt_get_info_obj) },
-    #endif
+    /* Sockopts */
+    { MP_ROM_QSTR(MP_QSTR_SO_SOCKET), MP_ROM_PTR(&mp_module_socket_globals_SOL_SOCKET) },
+    { MP_ROM_QSTR(MP_QSTR_SO_TCP), MP_ROM_PTR(&mp_module_socket_globals_SOL_TCP) },
+    { MP_ROM_QSTR(MP_QSTR_SO_UDP), MP_ROM_PTR(&mp_module_socket_globals_SOL_UDP) },
+    { MP_ROM_QSTR(MP_QSTR_SO_IP), MP_ROM_PTR(&mp_module_socket_globals_SOL_IP) },
+    { MP_ROM_QSTR(MP_QSTR_SO_IPV6), MP_ROM_PTR(&mp_module_socket_globals_SOL_IPV6) },
+    { MP_ROM_QSTR(MP_QSTR_SO_PACKET), MP_ROM_PTR(&mp_module_socket_globals_SOL_PACKET) },
+    { MP_ROM_QSTR(MP_QSTR_SO_TLS), MP_ROM_PTR(&mp_module_socket_globals_SOL_TLS) },
+    { MP_ROM_QSTR(MP_QSTR_SO_QUIC), MP_ROM_PTR(&mp_module_socket_globals_SOL_QUIC) },
+
+    /* Sockopts for compatibility */
+    { MP_ROM_QSTR(MP_QSTR_SO_REUSEADDR), MP_ROM_INT(ZSOCK_SO_REUSEADDR) },
+    { MP_ROM_QSTR(MP_QSTR_SO_BROADCAST), MP_ROM_INT(ZSOCK_SO_BROADCAST) },
+    { MP_ROM_QSTR(MP_QSTR_SO_KEEPALIVE), MP_ROM_INT(ZSOCK_SO_KEEPALIVE) },
+    { MP_ROM_QSTR(MP_QSTR_SO_SNDTIMEO), MP_ROM_INT(ZSOCK_SO_SNDTIMEO) },
+    { MP_ROM_QSTR(MP_QSTR_SO_RCVTIMEO), MP_ROM_INT(ZSOCK_SO_RCVTIMEO) },
+
 };
 
 static MP_DEFINE_CONST_DICT(mp_module_socket_globals, mp_module_socket_globals_table);
