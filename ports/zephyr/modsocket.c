@@ -896,7 +896,9 @@ static mp_obj_t mod_socket_getaddrinfo(size_t n_args, const mp_obj_t *pos_args, 
     } while ((ret == DNS_EAI_AGAIN || ret == DNS_EAI_CANCELED) && tries > 0);
     MP_THREAD_GIL_ENTER();
 
-    if (ret != 0) {
+    if (ret == DNS_EAI_SYSTEM) {
+        mp_raise_OSError(errno);
+    } else if (ret != 0) {
         mp_raise_OSError(ret > 0 ? -ret : ret);
     }
 

@@ -5,6 +5,10 @@
  */
 
 / {
+	chosen {
+		zephyr,mbedtls-heap = &heap_mbedtls;
+	};
+
 	fstab {
 		compatible = "zephyr,fstab";
 		lfs: lfs {
@@ -21,7 +25,13 @@
 
 	heap_psram {
 		compatible = "micropython,heap";
-		size = <DT_SIZE_M(4)>;
+		size = <DT_SIZE_K(3968)>;
+		memory-region = <&psram>;
+	};
+
+	heap_mbedtls: heap_mbedtls {
+		compatible = "zephyr,heap";
+		size = <DT_SIZE_K(128)>;
 		memory-region = <&psram>;
 	};
 };

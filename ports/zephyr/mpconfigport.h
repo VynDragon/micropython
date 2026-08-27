@@ -101,10 +101,12 @@
 #define MICROPY_PY_ERRNO            (1)
 #endif
 #ifdef CONFIG_NETWORKING
-#define MICROPY_PY_SOCKET           (1)
 #define MICROPY_PY_ZEPHYR_NETWORK   (1)
+#ifdef CONFIG_NET_SOCKETS
+#define MICROPY_PY_SOCKET           (1)
 #ifdef CONFIG_NET_SOCKETS_SOCKOPT_TLS
 #define MICROPY_PY_ZEPHYR_TLS       (1)
+#endif
 #endif
 #ifdef CONFIG_WIFI
 #define MICROPY_PY_ZEPHYR_NETWORK_WLAN (1)
@@ -210,4 +212,8 @@ typedef long mp_off_t;
 
 #ifdef CONFIG_NEWLIB_LIBC
 #define MICROPY_PY_MATH_POW_FIX_NAN (1)
+#endif
+
+#ifdef CONFIG_SOC_FAMILY_ESPRESSIF_ESP32
+#define MICROPY_PY_HASHLIB_SHA256 (0)
 #endif

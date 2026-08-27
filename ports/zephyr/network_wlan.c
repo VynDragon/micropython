@@ -31,6 +31,9 @@
 BUILD_ASSERT(IS_ENABLED(CONFIG_NETWORKING) && IS_ENABLED(CONFIG_WIFI),
     "CONFIG_NETWORKING and CONFIG_WIFI must be enabled to use MICROPY_PY_ZEPHYR_NETWORK_WLAN");
 
+BUILD_ASSERT(IS_ENABLED(CONFIG_WIFI_NM) && IS_ENABLED(CONFIG_NET_L2_WIFI_MGMT),
+    "CONFIG_WIFI_NM and CONFIG_NET_L2_WIFI_MGMT must be enabled to use MICROPY_PY_ZEPHYR_NETWORK_WLAN");
+
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/net/wifi.h>
 #include <zephyr/net/wifi_mgmt.h>
@@ -168,7 +171,7 @@ static void zephyr_wlan_updown(zephyr_wlan_obj_t *self, bool up)
         ps.type = WIFI_PS_PARAM_STATE;
 
         int ret = net_mgmt(NET_REQUEST_WIFI_PS, self->nic.net_if, &ps, sizeof(ps));
-        if (ret != 0) {
+        if (ret != 0 && ret != -ENOTSUP) {
             mp_raise_msg_varg(&mp_type_RuntimeError,
                 MP_ERROR_TEXT("failed to disable power save: %d"), ret);
         }
@@ -179,7 +182,7 @@ static void zephyr_wlan_updown(zephyr_wlan_obj_t *self, bool up)
         ps.type = WIFI_PS_PARAM_STATE;
 
         int ret = net_mgmt(NET_REQUEST_WIFI_PS, self->nic.net_if, &ps, sizeof(ps));
-        if (ret != 0) {
+        if (ret != 0 && ret != -ENOTSUP) {
             mp_raise_msg_varg(&mp_type_RuntimeError,
                 MP_ERROR_TEXT("failed to enable power save: %d"), ret);
         }
@@ -1071,9 +1074,9 @@ static mp_obj_t network_zephyr_wlan_config(size_t n_args, const mp_obj_t *args, 
             return mp_obj_new_int(self->network.band);
         case MP_QSTR_mode:
             if (atomic_test_bit(&self->state, ZEPHYR_WLAN_STATE_AP)) {
-                return mp_obj_new_int(WIFI_MODE_INFRA);
-            } else {
                 return mp_obj_new_int(WIFI_MODE_AP);
+            } else {
+                return mp_obj_new_int(WIFI_MODE_INFRA);
             }
         case MP_QSTR_link_mode:
         case MP_QSTR_protocol:
