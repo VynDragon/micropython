@@ -1,0 +1,99 @@
+/*
+ * Copyright (c) 2025-2026 MASSDRIVER EI (massdriver.space)
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <bflb/bl61x_em_32kb_wifi.dtsi>
+
+&wifi0 {
+	status = "okay";
+};
+
+/ {
+	chosen {
+		zephyr,mbedtls-heap = &heap_mbedtls;
+	};
+
+	fstab {
+		compatible = "zephyr,fstab";
+		lfs: lfs {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/flash";
+			partition = <&storage_partition>;
+			read-size=<16>;
+			prog-size=<256>;
+			cache-size=<1024>;
+			lookahead-size=<32>;
+			block-cycles=<4>;
+		};
+	};
+
+	heap_psram {
+		compatible = "micropython,heap";
+		size = <DT_SIZE_K(3968)>;
+		memory-region = <&psram>;
+	};
+
+	heap_mbedtls: heap_mbedtls {
+		compatible = "zephyr,heap";
+		size = <DT_SIZE_K(128)>;
+		memory-region = <&psram>;
+	};
+};
+
+&wdt0 {
+	status = "okay";
+};
+
+/* Fit envelope better to actual wireless RAM usage
+ * BLE takes off 32KB off WRAM
+ * Additionally, wifi picks about 68KB of uncached WRAM
+ */
+
+&all_ram {
+	reg = <0x62fc0000 DT_SIZE_K(380)>;
+	ranges = <0x0 0x62fc0000 DT_SIZE_K(380)>;
+};
+
+&wifi_ram {
+	/* 0x22fc0000 + all_ram */
+	reg = <0x2301f000 DT_SIZE_K(68)>;
+	ranges = <0x0 0x2301f000 DT_SIZE_K(68)>;
+};
+
+&pinctrl {
+	uart1_default: uart1_default {
+		group1 {
+			pinmux = <GPIO3_UART1_TX>;
+		};
+	};
+};
+
+&uart1 {
+	status = "okay";
+	current-speed = <115200>;
+	zephyr,deferred-init;
+	/* A pinctrl struct MUST have been allocated at build time to use dynamic pinctrl,
+	 * but it can be nonsense if needed as the device is deferred-init
+	 * and pinctrl won't be applied until device init.
+	 */
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-names = "default";
+};
+
+&pinctrl {
+	i2c1_default: i2c1_default {
+		group1 {
+			pinmux = <GPIO3_I2C1_SDA>;
+		};
+	};
+};
+
+&i2c1 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	zephyr,deferred-init;
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-names = "default";
+};
