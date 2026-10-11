@@ -1,0 +1,123 @@
+/*
+ * Copyright (c) 2025 MASSDRIVER EI (massdriver.space)
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	fstab {
+		compatible = "zephyr,fstab";
+		lfs: lfs {
+			compatible = "zephyr,fstab,littlefs";
+			mount-point = "/flash";
+			partition = <&storage_partition>;
+			read-size=<16>;
+			prog-size=<256>;
+			cache-size=<1024>;
+			lookahead-size=<32>;
+			block-cycles=<4>;
+		};
+	};
+
+	gpio0_related {
+		compatible = "micropython,related-pins-integer-generator";
+		gpio-device = <&gpio0>;
+		gpio-micropython-ranges = <0 4>, <10 6>, <17 1>, <20 3>, <27 4>;
+		gpio-zephyr-ranges = <0 4>, <10 6>, <17 1>, <20 3>, <27 4>;
+	};
+
+	named_related_0 {
+		compatible = "micropython,related-pins-arbitrary";
+		gpio-device = <&gpio0>;
+		gpio-micropython-strings = "R", "G", "B", "CW", "WW",
+			"red", "green", "blue", "coldwhite", "warmwhite",
+			"BOOT";
+		gpio-zephyr-ids = <1 30 0 29 27>,
+			<1 30 0 29 27>,
+			<2>;
+	};
+};
+
+&wdt0 {
+	status = "okay";
+};
+
+/delete-node/ &slot0_partition;
+/delete-node/ &storage_partition;
+
+&gd25lq32d {
+	partitions {
+		ranges;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		slot0_partition: partition@2000 {
+			compatible = "zephyr,mapped-partition";
+			label = "image-0";
+			reg = <0x00002000 (0x00200000 - 0x2000)>;
+			read-only;
+		};
+
+		storage_partition: partition@200000 {
+			compatible = "zephyr,mapped-partition";
+			label = "storage";
+			reg = <0x00200000 0x200000>;
+		};
+	};
+};
+
+&pinctrl {
+	uart1_default: uart1_default {
+		group1 {
+			pinmux = <GPIO3_UART1_TX>;
+		};
+	};
+};
+
+/* Fit envelope better to actual wireless RAM usage
+ * BLE takes off 32KB off WRAM
+ * Additionally, wifi picks about 68KB of uncached WRAM
+ */
+
+&all_ram {
+	reg = <0x62fc0000 DT_SIZE_K(380)>;
+	ranges = <0x0 0x62fc0000 DT_SIZE_K(380)>;
+};
+
+&wifi_ram {
+	/* 0x22fc0000 + all_ram */
+	reg = <0x2301f000 DT_SIZE_K(68)>;
+	ranges = <0x0 0x2301f000 DT_SIZE_K(68)>;
+};
+
+&uart1 {
+	status = "okay";
+	current-speed = <115200>;
+	zephyr,deferred-init;
+	/* A pinctrl struct MUST have been allocated at build time to use dynamic pinctrl,
+	 * but it can be nonsense if needed as the device is deferred-init
+	 * and pinctrl won't be applied until device init.
+	 */
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-names = "default";
+};
+
+&adc0 {
+	status = "disabled";
+};
+
+&pinctrl {
+	i2c1_default: i2c1_default {
+		group1 {
+			pinmux = <GPIO3_I2C1_SDA>;
+		};
+	};
+};
+
+&i2c1 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	zephyr,deferred-init;
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-names = "default";
+};
